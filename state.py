@@ -28,7 +28,8 @@ def default_state():
         "realized_pnl": 0.0,           # Total realized P&L across all closed trades (session)
         "profit_reserve": 0.0,          # Sequestered profit reserve (Phase 2)
         "last_action": None,            # Last action taken (for logging/debugging)
-        "last_action_time": None,       # Timestamp of last action
+        "last_action_time": None,
+        "last_sell_price": None,       # Price of last single-contract sell (re-entry trigger)
         "last_price": None,             # Last known price (for restart context)
         "week_start_balance": None,     # Account balance at Sunday open (for weekly tracking)
     }
@@ -133,6 +134,7 @@ def record_sell(state, price, qty, profit_reserve_pct):
         logger.info(f"Profit reserve +${reserve_addition:.2f} (total: ${state['profit_reserve']:.2f})")
 
     state['realized_pnl'] += pnl_dollars
+    state['last_sell_price'] = price   # Used for re-entry trigger after single contract win
     state['last_action'] = f"SELL {qty} @ {price:.2f} | PnL: ${pnl_dollars:.2f}"
     state['last_action_time'] = datetime.now().isoformat()
     state['last_price'] = price
@@ -162,23 +164,21 @@ def get_unrealized_pnl(state, current_price):
 
 
 def print_status(state, current_price=None):
-    """
-    Prints a clean status summary to the console.
-    Useful for monitoring the bot manually.
-    """
-    print("\n" + "="*50)
-    print("  MES BOT STATUS")
-    print("="*50)
-    print(f"  Active:         {state['is_active']}")
-    print(f"  Grid Level:     {state['grid_level']}")
-    print(f"  Total Qty:      {state['total_qty']} contracts")
-    print(f"  Avg Cost:       {state['average_cost']:.2f}" if state['average_cost'] else "  Avg Cost:       —")
-    print(f"  Lowest Buy:     {state['lowest_buy_price']:.2f}" if state['lowest_buy_price'] else "  Lowest Buy:     —")
+    lines = []
+    lines.append("\n" + "="*50)
+    lines.append("  MES BOT STATUS")
+    lines.append("="*50)
+    lines.append(f"  Active:         {state['is_active']}")
+    lines.append(f"  Grid Level:     {state['grid_level']}")
+    lines.append(f"  Total Qty:      {state.get('total_qty', 0)} contracts")
+    lines.append(f"  Avg Cost:       {state['average_cost']:.2f}" if state.get('average_cost') else "  Avg Cost:       —")
+    lines.append(f"  Lowest Buy:     {state['lowest_buy_price']:.2f}" if state.get('lowest_buy_price') else "  Lowest Buy:     —")
     if current_price:
         upnl = get_unrealized_pnl(state, current_price)
-        print(f"  Current Price:  {current_price:.2f}")
-        print(f"  Unrealized PnL: ${upnl:.2f}")
-    print(f"  Realized PnL:   ${state['realized_pnl']:.2f}")
-    print(f"  Profit Reserve: ${state['profit_reserve']:.2f}")
-    print(f"  Last Action:    {state['last_action']}")
-    print("="*50 + "\n")
+        lines.append(f"  Current Price:  {current_price:.2f}")
+        lines.append(f"  Unrealized PnL: ${upnl:.2f}")
+    lines.append(f"  Realized PnL:   ${state.get('realized_pnl', 0):.2f}")
+    lines.append(f"  Profit Reserve: ${state.get('profit_reserve', 0):.2f}")
+    lines.append(f"  Last Action:    {state.get('last_action')}")
+    lines.append("="*50 + "\n")
+    print("\n".join(lines))

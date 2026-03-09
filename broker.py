@@ -37,6 +37,7 @@ class Broker:
             try:
                 logger.info(f"Connecting to IB Gateway at {IB_HOST}:{IB_PORT} (attempt {attempt}/5)...")
                 self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+                self.ib.reqMarketDataType(3)  # 3 = delayed data, 1 = live
                 logger.info("Connected to IB Gateway.")
                 self._setup_contract()
                 return True
@@ -145,7 +146,7 @@ class Broker:
             logger.error("Cannot place buy — contract not set up.")
             return None
 
-        order = MarketOrder('BUY', qty)
+        order = MarketOrder('BUY', qty, tif='GTC', outsideRth=True)
         logger.info(f"Placing BUY order: {qty} x {self.contract.localSymbol}")
 
         trade = self.ib.placeOrder(self.contract, order)
@@ -170,7 +171,7 @@ class Broker:
             logger.error("Cannot place sell — contract not set up.")
             return None
 
-        order = MarketOrder('SELL', qty)
+        order = MarketOrder('SELL', qty, tif='GTC', outsideRth=True)
         logger.info(f"Placing SELL order: {qty} x {self.contract.localSymbol}")
 
         trade = self.ib.placeOrder(self.contract, order)
