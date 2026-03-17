@@ -37,7 +37,7 @@ class Broker:
             try:
                 logger.info(f"Connecting to IB Gateway at {IB_HOST}:{IB_PORT} (attempt {attempt}/5)...")
                 self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
-                self.ib.reqMarketDataType(3)  # 3 = delayed data, 1 = live
+                self.ib.reqMarketDataType(1)  # 1 = live data
                 logger.info("Connected to IB Gateway.")
                 self._setup_contract()
                 return True
