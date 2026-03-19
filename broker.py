@@ -96,10 +96,13 @@ class Broker:
         """
         Subscribes to real-time price ticks for the MES contract.
         Calls `callback(price)` every time a new trade price arrives.
+        Also hooks into portfolio updates as a backup price source.
         """
         self._price_callbacks.append(callback)
-        self.ticker = self.ib.reqMktData(self.contract, '', False, False)
+        self.ticker = self.ib.reqMktData(self.contract, '233', False, False)
         self.ticker.updateEvent += self._on_price_update
+        # Portfolio updates fire every ~3 min and serve as backup price source
+        self.ib.updatePortfolioEvent += self._on_portfolio_update
         logger.info(f"Price stream started for {self.contract.localSymbol}")
 
     def _on_price_update(self, ticker):
@@ -114,6 +117,21 @@ class Broker:
                     cb(price)
                 except Exception as e:
                     logger.error(f"Error in price callback: {e}")
+
+    def _on_portfolio_update(self, item):
+        """
+        Backup price source from portfolio update events (~3 min intervals).
+        Fires registered callbacks if ticker.last is not available.
+        """
+        if (item.contract.symbol == self.contract.symbol and
+                item.marketPrice and item.marketPrice > 0):
+            # Only use portfolio price if ticker isn't providing live prices
+            if not (self.ticker and self.ticker.last and self.ticker.last > 0):
+                for cb in self._price_callbacks:
+                    try:
+                        cb(item.marketPrice)
+                    except Exception as e:
+                        logger.error(f"Error in portfolio price callback: {e}")
 
     def get_current_price(self):
         """
