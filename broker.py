@@ -120,18 +120,16 @@ class Broker:
 
     def _on_portfolio_update(self, item):
         """
-        Backup price source from portfolio update events (~3 min intervals).
-        Fires registered callbacks if ticker.last is not available.
+        Price source from portfolio update events (~3 min intervals).
+        Always fires callbacks for MES — duplicate updates are harmless.
         """
         if (item.contract.symbol == self.contract.symbol and
                 item.marketPrice and item.marketPrice > 0):
-            # Only use portfolio price if ticker isn't providing live prices
-            if not (self.ticker and self.ticker.last and self.ticker.last > 0):
-                for cb in self._price_callbacks:
-                    try:
-                        cb(item.marketPrice)
-                    except Exception as e:
-                        logger.error(f"Error in portfolio price callback: {e}")
+            for cb in self._price_callbacks:
+                try:
+                    cb(item.marketPrice)
+                except Exception as e:
+                    logger.error(f"Error in portfolio price callback: {e}")
 
     def get_current_price(self):
         """

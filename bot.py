@@ -191,11 +191,19 @@ class MESBot:
         # Immediate entry check on startup if flat
         if not self.state['is_active'] and price:
             logger.info("Flat on startup — checking entry conditions.")
-            action, qty, reason = evaluate(self.state, price)
-            if action in (ACTION_BUY_INIT, ACTION_BUY_REENTER):
-                self._action_queue.put((action, qty, reason))
+            if self.state.get('weekend_closed', False):
+                # Bot missed Sunday open — buy immediately on next startup
+                self.state['weekend_closed'] = False
+                save_state(self.state)
+                self._action_queue.put((ACTION_BUY_INIT, INITIAL_QTY, "Post-weekend restart — entering immediately"))
                 self._pending_action = True
-                logger.info(f"Startup entry queued: {action} x{qty}")
+                logger.info("Post-weekend restart — queued immediate BUY_INIT")
+            else:
+                action, qty, reason = evaluate(self.state, price)
+                if action in (ACTION_BUY_INIT, ACTION_BUY_REENTER):
+                    self._action_queue.put((action, qty, reason))
+                    self._pending_action = True
+                    logger.info(f"Startup entry queued: {action} x{qty}")
 
         self.broker.start_price_stream(self._on_price_tick)
 
@@ -341,7 +349,14 @@ class MESBot:
                             self.state, filled,
                             self.state['total_qty'], PROFIT_RESERVE_PCT
                         )
-                        self.state['last_sell_price'] = None
+                        # FIX: Set last_sell_price to filled price instead of None.
+                        # Previously set to None which caused strategy.py to treat
+                        # the next price tick as a fresh start and immediately rebuy.
+                        # Now set to filled price so the 1.2% drop wait is enforced
+                        # after Friday close. Sunday open bypasses this via
+                        # should_open_for_week() which buys directly at 5 PM ET.
+                        self.state['last_sell_price'] = filled
+                        self.state['weekend_closed'] = True
                         save_state(self.state)
                         logger.info(
                             f"Weekly close done. "
@@ -359,6 +374,7 @@ class MESBot:
             if not self._week_opened:
                 logger.info("WEEKLY OPEN: Sunday 5:00 PM ET")
                 if not self.state['is_active']:
+                    self.state['weekend_closed'] = False
                     price = self.broker.buy(INITIAL_QTY)
                     if price:
                         self.state = record_buy(self.state, price, INITIAL_QTY)

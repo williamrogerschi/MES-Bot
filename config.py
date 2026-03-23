@@ -18,7 +18,7 @@ CONTRACT_TYPE = 'FUT'
 # Expiry: format is YYYYMM
 # March = 202603, June = 202606
 # Update this when rolling to the next contract
-CONTRACT_EXPIRY = '20260320'   # Jump to June as soon as it opens
+CONTRACT_EXPIRY = '20260618'   # Jump to June as soon as it opens
 
 # --- Grid Parameters ---
 GRID_PCT = 0.012             # 1.2% grid spacing (both up and down)
