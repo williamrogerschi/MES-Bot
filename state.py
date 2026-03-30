@@ -22,16 +22,17 @@ def default_state():
         "is_active": False,             # Is the bot currently holding or managing a position?
         "grid_level": 0,                # How many times we've averaged down (0 = just initial buy)
         "total_qty": 0,                 # Total contracts currently held
-        "buys": [],                     # List of individual buys: [{price, qty, timestamp}]
+        "buys": [],                     # List of individual lots: [{price, qty, timestamp}]
         "lowest_buy_price": None,       # Lowest price we bought at in current grid
         "average_cost": None,           # Weighted average cost of all current contracts
         "realized_pnl": 0.0,           # Total realized P&L across all closed trades (session)
-        "profit_reserve": 0.0,          # Sequestered profit reserve (Phase 2)
+        "profit_reserve": 0.0,          # Sequestered profit reserve
         "last_action": None,            # Last action taken (for logging/debugging)
         "last_action_time": None,
-        "last_sell_price": None,       # Price of last single-contract sell (re-entry trigger)
+        "last_sell_price": None,        # Price of last sell (re-entry trigger when flat)
         "last_price": None,             # Last known price (for restart context)
         "week_start_balance": None,     # Account balance at Sunday open (for weekly tracking)
+        "weekend_closed": False,        # Flag to trigger immediate rebuy after missed Sunday open
     }
 
 
@@ -83,26 +84,35 @@ def reset_state():
     return state
 
 
+def _recalculate(state):
+    """Recalculate derived fields from buys list."""
+    if not state['buys']:
+        state['lowest_buy_price'] = None
+        state['average_cost'] = None
+        state['total_qty'] = 0
+        state['grid_level'] = 0
+        state['is_active'] = False
+    else:
+        state['lowest_buy_price'] = min(b['price'] for b in state['buys'])
+        total_cost = sum(b['price'] * b['qty'] for b in state['buys'])
+        state['total_qty'] = sum(b['qty'] for b in state['buys'])
+        state['average_cost'] = total_cost / state['total_qty']
+        state['grid_level'] = len(state['buys']) - 1
+        state['is_active'] = True
+    return state
+
+
 def record_buy(state, price, qty):
     """
-    Records a new buy into state and recalculates derived fields.
+    Records a new buy lot into state and recalculates derived fields.
     """
     state['buys'].append({
         "price": price,
         "qty": qty,
         "timestamp": datetime.now().isoformat()
     })
-    state['total_qty'] += qty
-    state['is_active'] = True
-    state['grid_level'] = len(state['buys']) - 1  # 0-indexed: 0=initial, 1=first avg down, etc.
 
-    # Recalculate lowest buy price
-    state['lowest_buy_price'] = min(b['price'] for b in state['buys'])
-
-    # Recalculate weighted average cost
-    total_cost = sum(b['price'] * b['qty'] for b in state['buys'])
-    state['average_cost'] = total_cost / state['total_qty']
-
+    state = _recalculate(state)
     state['last_action'] = f"BUY {qty} @ {price:.2f}"
     state['last_action_time'] = datetime.now().isoformat()
     state['last_price'] = price
@@ -113,28 +123,77 @@ def record_buy(state, price, qty):
     return state
 
 
-def record_sell(state, price, qty, profit_reserve_pct):
+def record_lot_sell_and_rebuy(state, lot_index, sell_price, rebuy_price, profit_reserve_pct):
     """
-    Records a full position close, calculates P&L, and sequesters profit reserve.
-    Then resets position tracking fields.
+    Records a lot sell + immediate rebuy of 1 contract.
+    Sells the lot at lot_index, calculates P&L, then adds a new 1-contract lot at rebuy_price.
+    Position stays active — bot never goes flat with this action.
     """
-    if state['average_cost'] is None:
-        logger.error("record_sell called but no average_cost in state.")
+    if lot_index >= len(state['buys']):
+        logger.error(f"record_lot_sell_and_rebuy: lot_index {lot_index} out of range")
         return state
 
-    # MES point value = $5 per point
+    lot = state['buys'][lot_index]
+    qty_sold = lot['qty']
+    buy_price = lot['price']
+
+    # Calculate P&L for this lot
     MES_POINT_VALUE = 5.0
-    pnl_points = (price - state['average_cost']) * qty
+    pnl_points = (sell_price - buy_price) * qty_sold
     pnl_dollars = pnl_points * MES_POINT_VALUE
 
-    # Sequester portion of profit (only if profitable)
+    # Sequester portion of profit if profitable
     if pnl_dollars > 0:
         reserve_addition = pnl_dollars * profit_reserve_pct
         state['profit_reserve'] += reserve_addition
         logger.info(f"Profit reserve +${reserve_addition:.2f} (total: ${state['profit_reserve']:.2f})")
 
     state['realized_pnl'] += pnl_dollars
-    state['last_sell_price'] = price   # Used for re-entry trigger after single contract win
+
+    # Remove the sold lot
+    state['buys'].pop(lot_index)
+
+    # Add rebuy as new lot
+    state['buys'].append({
+        "price": rebuy_price,
+        "qty": 1,
+        "timestamp": datetime.now().isoformat()
+    })
+
+    # Recalculate derived fields
+    state = _recalculate(state)
+
+    state['last_action'] = (f"SELL {qty_sold} @ {sell_price:.2f} | "
+                            f"REBUY 1 @ {rebuy_price:.2f} | PnL: ${pnl_dollars:.2f}")
+    state['last_action_time'] = datetime.now().isoformat()
+    state['last_price'] = rebuy_price
+
+    logger.info(f"SELL {qty_sold} @ {sell_price:.2f} + REBUY 1 @ {rebuy_price:.2f} | "
+                f"PnL: ${pnl_dollars:.2f} | Total realized: ${state['realized_pnl']:.2f} | "
+                f"Remaining lots: {len(state['buys'])} | total_qty={state['total_qty']}")
+    return state
+
+
+def record_sell(state, price, qty, profit_reserve_pct):
+    """
+    Records a FULL position close — used for Friday close only.
+    Calculates P&L, sequesters reserve, resets all position fields.
+    """
+    if state['average_cost'] is None:
+        logger.error("record_sell called but no average_cost in state.")
+        return state
+
+    MES_POINT_VALUE = 5.0
+    pnl_points = (price - state['average_cost']) * qty
+    pnl_dollars = pnl_points * MES_POINT_VALUE
+
+    if pnl_dollars > 0:
+        reserve_addition = pnl_dollars * profit_reserve_pct
+        state['profit_reserve'] += reserve_addition
+        logger.info(f"Profit reserve +${reserve_addition:.2f} (total: ${state['profit_reserve']:.2f})")
+
+    state['realized_pnl'] += pnl_dollars
+    state['last_sell_price'] = price
     state['last_action'] = f"SELL {qty} @ {price:.2f} | PnL: ${pnl_dollars:.2f}"
     state['last_action_time'] = datetime.now().isoformat()
     state['last_price'] = price
@@ -147,7 +206,7 @@ def record_sell(state, price, qty, profit_reserve_pct):
     state['average_cost'] = None
     state['is_active'] = False
 
-    logger.info(f"SELL recorded: {qty} contract(s) @ {price:.2f} | "
+    logger.info(f"SELL ALL recorded: {qty} contract(s) @ {price:.2f} | "
                 f"PnL: ${pnl_dollars:.2f} | Total realized: ${state['realized_pnl']:.2f}")
     return state
 
@@ -164,10 +223,11 @@ def get_unrealized_pnl(state, current_price):
 
 
 def print_status(state, current_price=None):
+    from config import GRID_PCT
     lines = []
-    lines.append("\n" + "="*50)
+    lines.append("\n" + "="*52)
     lines.append("  MES BOT STATUS")
-    lines.append("="*50)
+    lines.append("="*52)
     lines.append(f"  Active:         {state['is_active']}")
     lines.append(f"  Grid Level:     {state['grid_level']}")
     lines.append(f"  Total Qty:      {state.get('total_qty', 0)} contracts")
@@ -179,6 +239,21 @@ def print_status(state, current_price=None):
         lines.append(f"  Unrealized PnL: ${upnl:.2f}")
     lines.append(f"  Realized PnL:   ${state.get('realized_pnl', 0):.2f}")
     lines.append(f"  Profit Reserve: ${state.get('profit_reserve', 0):.2f}")
-    lines.append(f"  Last Action:    {state.get('last_action')}")
-    lines.append("="*50 + "\n")
+    lines.append(f"  Last Action:    {state.get('last_action', '—')}")
+
+    # Show each lot's sell trigger
+    if state.get('is_active') and state.get('buys'):
+        lines.append("  Lots:")
+        for i, lot in enumerate(state['buys']):
+            trigger = lot['price'] * (1 + GRID_PCT)
+            lines.append(f"    [{i}] {lot['qty']} @ {lot['price']:.2f} → sell trigger {trigger:.2f}")
+    elif state.get('last_sell_price') and not state.get('is_active'):
+        reentry = state['last_sell_price'] * (1 - GRID_PCT)
+        lines.append(f"  Re-entry At:    {reentry:.2f} (1.2% below sell {state['last_sell_price']:.2f})")
+
+    if state.get('lowest_buy_price'):
+        dip_t = state['lowest_buy_price'] * (1 - GRID_PCT)
+        lines.append(f"  Dip Trigger:    {dip_t:.2f}")
+
+    lines.append("="*52 + "\n")
     print("\n".join(lines))

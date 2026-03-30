@@ -175,7 +175,12 @@ class Broker:
                 logger.info(f"BUY filled: {qty} @ {filled_price:.2f}")
                 return filled_price
 
-        logger.error(f"BUY order not filled after 30 seconds. Status: {trade.orderStatus.status}")
+        # Cancel the order so it doesn't fill later as a GTC orphan
+        try:
+            self.ib.cancelOrder(trade.order)
+            logger.warning(f"BUY order timed out — cancelled to prevent GTC orphan.")
+        except Exception as e:
+            logger.error(f"Failed to cancel timed-out BUY order: {e}")
         return None
 
     def sell(self, qty):
@@ -200,7 +205,12 @@ class Broker:
                 logger.info(f"SELL filled: {qty} @ {filled_price:.2f}")
                 return filled_price
 
-        logger.error(f"SELL order not filled after 30 seconds. Status: {trade.orderStatus.status}")
+        # Cancel the order so it doesn't fill later as a GTC orphan
+        try:
+            self.ib.cancelOrder(trade.order)
+            logger.warning(f"SELL order timed out — cancelled to prevent GTC orphan.")
+        except Exception as e:
+            logger.error(f"Failed to cancel timed-out SELL order: {e}")
         return None
 
     def close_all_positions(self):

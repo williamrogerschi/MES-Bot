@@ -15,12 +15,13 @@ from state import get_unrealized_pnl
 logger = logging.getLogger(__name__)
 
 # Action constants
-ACTION_NONE         = "NONE"
-ACTION_BUY_INIT     = "BUY_INIT"     # First entry into position
-ACTION_BUY_REENTER  = "BUY_REENTER"  # Re-entry after single contract win
-ACTION_BUY_AVG      = "BUY_AVG"      # Average down on dip
-ACTION_SELL_ALL     = "SELL_ALL"     # Sell entire position (profitable)
-ACTION_HOLD         = "HOLD"         # At sell trigger but not profitable — hold
+ACTION_NONE             = "NONE"
+ACTION_BUY_INIT         = "BUY_INIT"         # First entry into position
+ACTION_BUY_REENTER      = "BUY_REENTER"      # Re-entry after being flat
+ACTION_BUY_AVG          = "BUY_AVG"          # Average down on dip
+ACTION_SELL_AND_REBUY   = "SELL_AND_REBUY"   # Sell a lot, immediately rebuy 1
+ACTION_SELL_ALL         = "SELL_ALL"         # Close all positions (Friday close only)
+ACTION_HOLD             = "HOLD"             # Nothing to do
 
 
 def check_margin_available(current_qty, additional_qty):
@@ -42,15 +43,13 @@ def check_margin_available(current_qty, additional_qty):
 
 def evaluate(state, current_price):
     """
-    Core grid logic. Returns (action, qty, reason).
+    Core grid logic. Returns (action, payload, reason).
 
-    Entry logic:
-      - If flat and no last_sell_price: buy immediately (fresh start)
-      - If flat and last_sell_price set: wait for -1.2% from last sell before re-entering
-      - If holding 1 and price rises 1.2%: sell, go flat (no immediate rebuy)
-      - If holding 3+ (averaged down) and price rises 1.2% from lowest buy
-        AND profitable: sell all, immediately rebuy 1
-      - If holding any and price drops 1.2% from lowest: average down
+    Payload meaning per action:
+      ACTION_BUY_INIT / BUY_REENTER / BUY_AVG  → payload = qty to buy
+      ACTION_SELL_AND_REBUY                      → payload = lot index to sell
+      ACTION_SELL_ALL                            → payload = total qty
+      ACTION_NONE / ACTION_HOLD                  → payload = 0
     """
 
     # ── Case 1: Flat — decide whether to enter ──────────────────────
@@ -69,7 +68,7 @@ def evaluate(state, current_price):
                 return (ACTION_NONE, 0, "Flat but margin limit reached")
 
         else:
-            # We sold a single contract — wait for -1.2% from sell price
+            # Wait for -1.2% from last sell price before re-entering
             reentry_trigger = last_sell * (1 - GRID_PCT)
             if current_price <= reentry_trigger:
                 if check_margin_available(0, INITIAL_QTY):
@@ -89,57 +88,18 @@ def evaluate(state, current_price):
                     f"(current: {current_price:.2f}, last sell: {last_sell:.2f})"
                 )
 
-    # We have an active position from here down
+    # ── Active position from here down ───────────────────────────────
+    buys = state['buys']
     lowest_buy = state['lowest_buy_price']
-    avg_cost   = state['average_cost']
-    total_qty  = state['total_qty']
+    total_qty = state['total_qty']
     grid_level = state['grid_level']
 
-    if lowest_buy is None or avg_cost is None:
-        return (ACTION_NONE, 0, "State error: missing price data")
+    if not buys or lowest_buy is None:
+        return (ACTION_NONE, 0, "State error: missing buy data")
 
-    # ── Key price levels ─────────────────────────────────────────────
-    sell_trigger = lowest_buy * (1 + GRID_PCT)   # +1.2% from lowest buy
-    dip_trigger  = lowest_buy * (1 - GRID_PCT)   # -1.2% from lowest buy
-    unrealized   = get_unrealized_pnl(state, current_price)
+    # ── Case 2: Price dropped to dip trigger — average down ──────────
+    dip_trigger = lowest_buy * (1 - GRID_PCT)
 
-    logger.debug(
-        f"Price: {current_price:.2f} | Lowest: {lowest_buy:.2f} | "
-        f"Avg: {avg_cost:.2f} | Sell: {sell_trigger:.2f} | "
-        f"Dip: {dip_trigger:.2f} | uPnL: ${unrealized:.2f} | "
-        f"Grid level: {grid_level}"
-    )
-
-    # ── Case 2: Price hit sell trigger ───────────────────────────────
-    if current_price >= sell_trigger:
-        if unrealized >= 0:
-            return (
-                ACTION_SELL_ALL,
-                total_qty,
-                f"Price {current_price:.2f} >= sell trigger {sell_trigger:.2f} | "
-                f"uPnL ${unrealized:.2f} | grid_level={grid_level} — SELL ALL {total_qty}"
-            )
-        else:
-            # At trigger but still underwater — hold for breakeven
-            return (
-                ACTION_HOLD,
-                0,
-                f"Price {current_price:.2f} >= sell trigger but uPnL "
-                f"${unrealized:.2f} < 0 — holding for breakeven @ {avg_cost:.2f}"
-            )
-
-    # ── Case 3: Averaged-down position reached breakeven ─────────────
-    # Catches case where sell trigger passed unprofitably and price
-    # continued climbing to the actual breakeven
-    if grid_level > 0 and current_price >= avg_cost and unrealized >= 0:
-        return (
-            ACTION_SELL_ALL,
-            total_qty,
-            f"Price {current_price:.2f} reached breakeven {avg_cost:.2f} "
-            f"on averaged-down position — SELL ALL {total_qty}"
-        )
-
-    # ── Case 4: Price dropped to dip trigger — average down ──────────
     if current_price <= dip_trigger:
         if grid_level >= MAX_GRID_LEVELS:
             return (
@@ -161,12 +121,25 @@ def evaluate(state, current_price):
             f"(grid level {grid_level} -> {grid_level + 1})"
         )
 
-    # ── Case 5: Price in range — nothing to do ───────────────────────
+    # ── Case 3: Check each lot's individual sell trigger ─────────────
+    # Process lowest lot first (most recently bought, hits trigger first on recovery)
+    # Sort by price ascending so we process the lowest-priced lot first
+    for i, lot in enumerate(buys):
+        sell_trigger = lot['price'] * (1 + GRID_PCT)
+        if current_price >= sell_trigger:
+            return (
+                ACTION_SELL_AND_REBUY,
+                i,
+                f"Price {current_price:.2f} >= lot sell trigger {sell_trigger:.2f} "
+                f"(lot: {lot['qty']} @ {lot['price']:.2f}) — sell {lot['qty']}, rebuy 1"
+            )
+
+    # ── Case 4: Price in range — nothing to do ───────────────────────
     return (
-        ACTION_NONE,
+        ACTION_HOLD,
         0,
         f"Price {current_price:.2f} between dip {dip_trigger:.2f} "
-        f"and sell {sell_trigger:.2f} — holding {total_qty} contract(s)"
+        f"and lowest sell trigger {buys[0]['price'] * (1 + GRID_PCT):.2f} — holding {total_qty} contract(s)"
     )
 
 
@@ -197,9 +170,9 @@ def should_open_for_week(now):
 
 
 def calculate_next_levels(state):
-    """Returns (sell_trigger, dip_trigger) for status display."""
-    if not state['is_active'] or not state['lowest_buy_price']:
+    """Returns (lowest_sell_trigger, dip_trigger) for status display."""
+    if not state['is_active'] or not state['lowest_buy_price'] or not state['buys']:
         return None, None
-    sell = state['lowest_buy_price'] * (1 + GRID_PCT)
-    dip  = state['lowest_buy_price'] * (1 - GRID_PCT)
-    return sell, dip
+    lowest_sell = min(lot['price'] * (1 + GRID_PCT) for lot in state['buys'])
+    dip = state['lowest_buy_price'] * (1 - GRID_PCT)
+    return lowest_sell, dip

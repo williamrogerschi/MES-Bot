@@ -19,11 +19,11 @@ from strategy import (
     evaluate, should_close_for_weekend, should_open_for_week,
     calculate_next_levels,
     ACTION_NONE, ACTION_BUY_INIT, ACTION_BUY_REENTER,
-    ACTION_BUY_AVG, ACTION_SELL_ALL, ACTION_HOLD
+    ACTION_BUY_AVG, ACTION_SELL_ALL, ACTION_SELL_AND_REBUY, ACTION_HOLD
 )
 from state import (
     load_state, save_state, reset_state,
-    record_buy, record_sell, get_unrealized_pnl
+    record_buy, record_sell, record_lot_sell_and_rebuy, get_unrealized_pnl
 )
 
 # ── Logging Setup ─────────────────────────────────────────────
@@ -272,6 +272,8 @@ class MESBot:
         try:
             if action in (ACTION_BUY_INIT, ACTION_BUY_REENTER, ACTION_BUY_AVG):
                 self._execute_buy(qty)
+            elif action == ACTION_SELL_AND_REBUY:
+                self._execute_sell_and_rebuy(qty)  # qty = lot_index here
             elif action == ACTION_SELL_ALL:
                 self._execute_sell(qty, self.state['grid_level'])
         except Exception as e:
@@ -292,6 +294,39 @@ class MESBot:
             print_status(self.state, self._last_price)
         else:
             logger.error(f"Buy failed for {qty} contracts — will retry on next tick")
+
+    def _execute_sell_and_rebuy(self, lot_index):
+        """Sell a specific lot and immediately rebuy 1 contract at market."""
+        if lot_index >= len(self.state['buys']):
+            logger.error(f"Lot index {lot_index} out of range — skipping")
+            return
+
+        lot = self.state['buys'][lot_index]
+        qty_to_sell = lot['qty']
+
+        # Sell the lot
+        sell_price = self.broker.sell(qty_to_sell)
+        if not sell_price:
+            logger.error(f"Sell failed for lot {lot_index} ({qty_to_sell} contracts)")
+            return
+
+        # Immediately rebuy 1 at market
+        time.sleep(1)
+        rebuy_price = self.broker.buy(INITIAL_QTY)
+        if not rebuy_price:
+            logger.error("Rebuy failed after lot sell — position partially closed")
+            # Still record the sell with a placeholder rebuy at sell price
+            rebuy_price = sell_price
+
+        self.state = record_lot_sell_and_rebuy(
+            self.state, lot_index, sell_price, rebuy_price, PROFIT_RESERVE_PCT
+        )
+        save_state(self.state)
+        logger.info(
+            f"✅ SELL {qty_to_sell} @ {sell_price:.2f} + REBUY 1 @ {rebuy_price:.2f} | "
+            f"PnL: ${self.state['realized_pnl']:.2f} | Reserve: ${self.state['profit_reserve']:.2f}"
+        )
+        print_status(self.state, self._last_price)
 
     def _execute_sell(self, qty, grid_level):
         filled_price = self.broker.sell(qty)
