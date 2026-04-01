@@ -19,11 +19,13 @@ from strategy import (
     evaluate, should_close_for_weekend, should_open_for_week,
     calculate_next_levels,
     ACTION_NONE, ACTION_BUY_INIT, ACTION_BUY_REENTER,
-    ACTION_BUY_AVG, ACTION_SELL_ALL, ACTION_SELL_AND_REBUY, ACTION_HOLD
+    ACTION_BUY_AVG, ACTION_SELL_ALL, ACTION_SELL_AND_REBUY,
+    ACTION_SELL_SINGLE, ACTION_HOLD
 )
 from state import (
     load_state, save_state, reset_state,
-    record_buy, record_sell, record_lot_sell_and_rebuy, get_unrealized_pnl
+    record_buy, record_sell, record_lot_sell_and_rebuy,
+    record_lot_sell_single, get_unrealized_pnl
 )
 
 # ── Logging Setup ─────────────────────────────────────────────
@@ -34,13 +36,11 @@ def setup_logging():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # File handler — flush after every write
     fh = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8', delay=False)
     fh.setLevel(level)
     fh.setFormatter(fmt)
-    fh.flush = lambda: fh.stream.flush()  # Force flush on every record
+    fh.flush = lambda: fh.stream.flush()
 
-    # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
@@ -53,7 +53,6 @@ def setup_logging():
     atexit.register(logging.shutdown)
     root.addHandler(ch)
 
-    # Force flush after every log record
     logging.raiseExceptions = False
     for handler in root.handlers:
         handler.flush()
@@ -74,6 +73,7 @@ _print_lock = threading.Lock()
 
 def print_status(state, current_price=None):
     """Builds the full status block as one string and prints atomically."""
+    from config import GRID_PCT
     lines = []
     lines.append("\n" + "="*52)
     lines.append("  MES BOT STATUS")
@@ -96,17 +96,20 @@ def print_status(state, current_price=None):
     lines.append(f"  Profit Reserve: ${state.get('profit_reserve', 0.0):.2f}")
     lines.append(f"  Last Action:    {state.get('last_action', '—')}")
 
-    last_sell = state.get('last_sell_price')
-    if last_sell and not state.get('is_active'):
-        reentry = last_sell * (1 - 0.012)
+    # Show each lot's individual sell trigger
+    if state.get('is_active') and state.get('buys'):
+        lines.append("  Lots:")
+        for i, lot in enumerate(state['buys']):
+            trigger = lot['price'] * (1 + GRID_PCT)
+            action = "sell+rebuy" if lot['qty'] >= 2 else "sell only"
+            lines.append(f"    [{i}] {lot['qty']} @ {lot['price']:.2f} → sell {trigger:.2f} ({action})")
+        if low:
+            dip_t = low * (1 - GRID_PCT)
+            lines.append(f"  Dip Trigger:    {dip_t:.2f}")
+    elif state.get('last_sell_price') and not state.get('is_active'):
+        last_sell = state.get('last_sell_price')
+        reentry = last_sell * (1 - GRID_PCT)
         lines.append(f"  Re-entry At:    {reentry:.2f} (1.2% below sell {last_sell:.2f})")
-
-    if state.get('is_active') and low:
-        from config import GRID_PCT
-        sell_t = low * (1 + GRID_PCT)
-        dip_t  = low * (1 - GRID_PCT)
-        lines.append(f"  Sell Trigger:   {sell_t:.2f}")
-        lines.append(f"  Dip Trigger:    {dip_t:.2f}")
 
     lines.append("="*52 + "\n")
 
@@ -192,7 +195,6 @@ class MESBot:
         if not self.state['is_active'] and price:
             logger.info("Flat on startup — checking entry conditions.")
             if self.state.get('weekend_closed', False):
-                # Bot missed Sunday open — buy immediately on next startup
                 self.state['weekend_closed'] = False
                 save_state(self.state)
                 self._action_queue.put((ACTION_BUY_INIT, INITIAL_QTY, "Post-weekend restart — entering immediately"))
@@ -273,7 +275,9 @@ class MESBot:
             if action in (ACTION_BUY_INIT, ACTION_BUY_REENTER, ACTION_BUY_AVG):
                 self._execute_buy(qty)
             elif action == ACTION_SELL_AND_REBUY:
-                self._execute_sell_and_rebuy(qty)  # qty = lot_index here
+                self._execute_sell_and_rebuy(qty)  # qty = lot_index
+            elif action == ACTION_SELL_SINGLE:
+                self._execute_sell_single(qty)     # qty = lot_index
             elif action == ACTION_SELL_ALL:
                 self._execute_sell(qty, self.state['grid_level'])
         except Exception as e:
@@ -296,7 +300,7 @@ class MESBot:
             logger.error(f"Buy failed for {qty} contracts — will retry on next tick")
 
     def _execute_sell_and_rebuy(self, lot_index):
-        """Sell a specific lot and immediately rebuy 1 contract at market."""
+        """Sell an averaged-down lot (qty>=2) and immediately rebuy 1."""
         if lot_index >= len(self.state['buys']):
             logger.error(f"Lot index {lot_index} out of range — skipping")
             return
@@ -304,18 +308,15 @@ class MESBot:
         lot = self.state['buys'][lot_index]
         qty_to_sell = lot['qty']
 
-        # Sell the lot
         sell_price = self.broker.sell(qty_to_sell)
         if not sell_price:
             logger.error(f"Sell failed for lot {lot_index} ({qty_to_sell} contracts)")
             return
 
-        # Immediately rebuy 1 at market
         time.sleep(1)
         rebuy_price = self.broker.buy(INITIAL_QTY)
         if not rebuy_price:
             logger.error("Rebuy failed after lot sell — position partially closed")
-            # Still record the sell with a placeholder rebuy at sell price
             rebuy_price = sell_price
 
         self.state = record_lot_sell_and_rebuy(
@@ -324,6 +325,30 @@ class MESBot:
         save_state(self.state)
         logger.info(
             f"✅ SELL {qty_to_sell} @ {sell_price:.2f} + REBUY 1 @ {rebuy_price:.2f} | "
+            f"PnL: ${self.state['realized_pnl']:.2f} | Reserve: ${self.state['profit_reserve']:.2f}"
+        )
+        print_status(self.state, self._last_price)
+
+    def _execute_sell_single(self, lot_index):
+        """Sell a single contract lot with no rebuy."""
+        if lot_index >= len(self.state['buys']):
+            logger.error(f"Lot index {lot_index} out of range — skipping")
+            return
+
+        lot = self.state['buys'][lot_index]
+        qty_to_sell = lot['qty']  # Should always be 1
+
+        sell_price = self.broker.sell(qty_to_sell)
+        if not sell_price:
+            logger.error(f"Sell failed for lot {lot_index} ({qty_to_sell} contracts)")
+            return
+
+        self.state = record_lot_sell_single(
+            self.state, lot_index, sell_price, PROFIT_RESERVE_PCT
+        )
+        save_state(self.state)
+        logger.info(
+            f"✅ SELL {qty_to_sell} @ {sell_price:.2f} (no rebuy) | "
             f"PnL: ${self.state['realized_pnl']:.2f} | Reserve: ${self.state['profit_reserve']:.2f}"
         )
         print_status(self.state, self._last_price)
@@ -341,25 +366,6 @@ class MESBot:
                 f"Reserve: ${self.state['profit_reserve']:.2f}"
             )
             print_status(self.state, self._last_price)
-
-            if grid_level > 0:
-                # Averaged-down position — rebuy 1 immediately
-                time.sleep(1)
-                logger.info("Averaged-down position closed — re-entering with 1 contract.")
-                new_price = self.broker.buy(INITIAL_QTY)
-                if new_price:
-                    self.state = record_buy(self.state, new_price, INITIAL_QTY)
-                    save_state(self.state)
-                    logger.info(f"✅ RE-ENTRY 1 @ {new_price:.2f}")
-                    print_status(self.state, self._last_price)
-                else:
-                    logger.error("Re-entry failed — flat, will re-enter on next tick")
-            else:
-                reentry = filled_price * (1 - 0.012)
-                logger.info(
-                    f"Single contract win — now flat. "
-                    f"Re-entry trigger: {reentry:.2f}"
-                )
         else:
             logger.error(f"Sell failed for {qty} contracts")
 
@@ -384,12 +390,6 @@ class MESBot:
                             self.state, filled,
                             self.state['total_qty'], PROFIT_RESERVE_PCT
                         )
-                        # FIX: Set last_sell_price to filled price instead of None.
-                        # Previously set to None which caused strategy.py to treat
-                        # the next price tick as a fresh start and immediately rebuy.
-                        # Now set to filled price so the 1.2% drop wait is enforced
-                        # after Friday close. Sunday open bypasses this via
-                        # should_open_for_week() which buys directly at 5 PM ET.
                         self.state['last_sell_price'] = filled
                         self.state['weekend_closed'] = True
                         save_state(self.state)
@@ -399,6 +399,8 @@ class MESBot:
                             f"Reserve: ${self.state['profit_reserve']:.2f}"
                         )
                         print_status(self.state, self._last_price)
+                    else:
+                        logger.error("Friday close FAILED — will retry next tick")
                 else:
                     logger.info("Friday close — no active position.")
 

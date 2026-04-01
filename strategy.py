@@ -19,15 +19,13 @@ ACTION_NONE             = "NONE"
 ACTION_BUY_INIT         = "BUY_INIT"         # First entry into position
 ACTION_BUY_REENTER      = "BUY_REENTER"      # Re-entry after being flat
 ACTION_BUY_AVG          = "BUY_AVG"          # Average down on dip
-ACTION_SELL_AND_REBUY   = "SELL_AND_REBUY"   # Sell a lot, immediately rebuy 1
+ACTION_SELL_AND_REBUY   = "SELL_AND_REBUY"   # Sell a lot (qty>=2), immediately rebuy 1
+ACTION_SELL_SINGLE      = "SELL_SINGLE"      # Sell a single contract lot, no rebuy
 ACTION_SELL_ALL         = "SELL_ALL"         # Close all positions (Friday close only)
 ACTION_HOLD             = "HOLD"             # Nothing to do
 
 
 def check_margin_available(current_qty, additional_qty):
-    """
-    Safety check: ensures buying won't exceed max margin usage.
-    """
     total_qty = current_qty + additional_qty
     required_margin = total_qty * MES_MARGIN_PER_CONTRACT
     max_allowed = ACCOUNT_SIZE * MAX_MARGIN_USAGE
@@ -48,6 +46,7 @@ def evaluate(state, current_price):
     Payload meaning per action:
       ACTION_BUY_INIT / BUY_REENTER / BUY_AVG  → payload = qty to buy
       ACTION_SELL_AND_REBUY                      → payload = lot index to sell
+      ACTION_SELL_SINGLE                         → payload = lot index to sell
       ACTION_SELL_ALL                            → payload = total qty
       ACTION_NONE / ACTION_HOLD                  → payload = 0
     """
@@ -57,7 +56,6 @@ def evaluate(state, current_price):
         last_sell = state.get('last_sell_price')
 
         if last_sell is None:
-            # Fresh start — no prior sell price, enter immediately
             if check_margin_available(0, INITIAL_QTY):
                 return (
                     ACTION_BUY_INIT,
@@ -68,7 +66,6 @@ def evaluate(state, current_price):
                 return (ACTION_NONE, 0, "Flat but margin limit reached")
 
         else:
-            # Wait for -1.2% from last sell price before re-entering
             reentry_trigger = last_sell * (1 - GRID_PCT)
             if current_price <= reentry_trigger:
                 if check_margin_available(0, INITIAL_QTY):
@@ -122,17 +119,25 @@ def evaluate(state, current_price):
         )
 
     # ── Case 3: Check each lot's individual sell trigger ─────────────
-    # Process lowest lot first (most recently bought, hits trigger first on recovery)
-    # Sort by price ascending so we process the lowest-priced lot first
+    # qty >= 2 = averaged-down lot → sell all, rebuy 1
+    # qty == 1 = single contract (original or rebuy) → just sell, no rebuy
     for i, lot in enumerate(buys):
         sell_trigger = lot['price'] * (1 + GRID_PCT)
         if current_price >= sell_trigger:
-            return (
-                ACTION_SELL_AND_REBUY,
-                i,
-                f"Price {current_price:.2f} >= lot sell trigger {sell_trigger:.2f} "
-                f"(lot: {lot['qty']} @ {lot['price']:.2f}) — sell {lot['qty']}, rebuy 1"
-            )
+            if lot['qty'] >= 2:
+                return (
+                    ACTION_SELL_AND_REBUY,
+                    i,
+                    f"Price {current_price:.2f} >= lot sell trigger {sell_trigger:.2f} "
+                    f"(lot: {lot['qty']} @ {lot['price']:.2f}) — sell {lot['qty']}, rebuy 1"
+                )
+            else:
+                return (
+                    ACTION_SELL_SINGLE,
+                    i,
+                    f"Price {current_price:.2f} >= lot sell trigger {sell_trigger:.2f} "
+                    f"(lot: 1 @ {lot['price']:.2f}) — sell 1, no rebuy"
+                )
 
     # ── Case 4: Price in range — nothing to do ───────────────────────
     return (

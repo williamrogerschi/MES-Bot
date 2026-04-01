@@ -1,7 +1,5 @@
 # ============================================================
 # state.py — Position State Persistence
-# Writes bot state to disk after every trade so the bot
-# can shut down and restart without losing position context.
 # ============================================================
 
 import json
@@ -14,33 +12,25 @@ logger = logging.getLogger(__name__)
 
 
 def default_state():
-    """
-    Returns a clean slate state — used on first ever run
-    or after a manual reset.
-    """
     return {
-        "is_active": False,             # Is the bot currently holding or managing a position?
-        "grid_level": 0,                # How many times we've averaged down (0 = just initial buy)
-        "total_qty": 0,                 # Total contracts currently held
-        "buys": [],                     # List of individual lots: [{price, qty, timestamp}]
-        "lowest_buy_price": None,       # Lowest price we bought at in current grid
-        "average_cost": None,           # Weighted average cost of all current contracts
-        "realized_pnl": 0.0,           # Total realized P&L across all closed trades (session)
-        "profit_reserve": 0.0,          # Sequestered profit reserve
-        "last_action": None,            # Last action taken (for logging/debugging)
+        "is_active": False,
+        "grid_level": 0,
+        "total_qty": 0,
+        "buys": [],
+        "lowest_buy_price": None,
+        "average_cost": None,
+        "realized_pnl": 0.0,
+        "profit_reserve": 0.0,
+        "last_action": None,
         "last_action_time": None,
-        "last_sell_price": None,        # Price of last sell (re-entry trigger when flat)
-        "last_price": None,             # Last known price (for restart context)
-        "week_start_balance": None,     # Account balance at Sunday open (for weekly tracking)
-        "weekend_closed": False,        # Flag to trigger immediate rebuy after missed Sunday open
+        "last_sell_price": None,
+        "last_price": None,
+        "week_start_balance": None,
+        "weekend_closed": False,
     }
 
 
 def load_state():
-    """
-    Loads state from disk. If no state file exists, returns default state.
-    Called on bot startup to resume after a restart.
-    """
     if not os.path.exists(STATE_FILE):
         logger.info("No state file found — starting with clean state.")
         return default_state()
@@ -57,11 +47,6 @@ def load_state():
 
 
 def save_state(state):
-    """
-    Saves state to disk. Called after every trade action.
-    Uses a temp file + rename for atomic write (prevents corruption
-    if the bot crashes mid-write).
-    """
     state['last_saved'] = datetime.now().isoformat()
     temp_file = STATE_FILE + '.tmp'
     try:
@@ -74,10 +59,6 @@ def save_state(state):
 
 
 def reset_state():
-    """
-    Resets to a clean slate and saves it.
-    Called after Friday close or manual reset.
-    """
     state = default_state()
     save_state(state)
     logger.info("State reset to clean slate.")
@@ -103,15 +84,11 @@ def _recalculate(state):
 
 
 def record_buy(state, price, qty):
-    """
-    Records a new buy lot into state and recalculates derived fields.
-    """
     state['buys'].append({
         "price": price,
         "qty": qty,
         "timestamp": datetime.now().isoformat()
     })
-
     state = _recalculate(state)
     state['last_action'] = f"BUY {qty} @ {price:.2f}"
     state['last_action_time'] = datetime.now().isoformat()
@@ -125,9 +102,8 @@ def record_buy(state, price, qty):
 
 def record_lot_sell_and_rebuy(state, lot_index, sell_price, rebuy_price, profit_reserve_pct):
     """
-    Records a lot sell + immediate rebuy of 1 contract.
-    Sells the lot at lot_index, calculates P&L, then adds a new 1-contract lot at rebuy_price.
-    Position stays active — bot never goes flat with this action.
+    Sell an averaged-down lot (qty>=2) and immediately rebuy 1.
+    Position stays active — never goes flat.
     """
     if lot_index >= len(state['buys']):
         logger.error(f"record_lot_sell_and_rebuy: lot_index {lot_index} out of range")
@@ -137,12 +113,10 @@ def record_lot_sell_and_rebuy(state, lot_index, sell_price, rebuy_price, profit_
     qty_sold = lot['qty']
     buy_price = lot['price']
 
-    # Calculate P&L for this lot
     MES_POINT_VALUE = 5.0
     pnl_points = (sell_price - buy_price) * qty_sold
     pnl_dollars = pnl_points * MES_POINT_VALUE
 
-    # Sequester portion of profit if profitable
     if pnl_dollars > 0:
         reserve_addition = pnl_dollars * profit_reserve_pct
         state['profit_reserve'] += reserve_addition
@@ -150,19 +124,15 @@ def record_lot_sell_and_rebuy(state, lot_index, sell_price, rebuy_price, profit_
 
     state['realized_pnl'] += pnl_dollars
 
-    # Remove the sold lot
+    # Remove sold lot, add rebuy lot
     state['buys'].pop(lot_index)
-
-    # Add rebuy as new lot
     state['buys'].append({
         "price": rebuy_price,
         "qty": 1,
         "timestamp": datetime.now().isoformat()
     })
 
-    # Recalculate derived fields
     state = _recalculate(state)
-
     state['last_action'] = (f"SELL {qty_sold} @ {sell_price:.2f} | "
                             f"REBUY 1 @ {rebuy_price:.2f} | PnL: ${pnl_dollars:.2f}")
     state['last_action_time'] = datetime.now().isoformat()
@@ -174,11 +144,47 @@ def record_lot_sell_and_rebuy(state, lot_index, sell_price, rebuy_price, profit_
     return state
 
 
+def record_lot_sell_single(state, lot_index, sell_price, profit_reserve_pct):
+    """
+    Sell a single contract lot (qty==1) with no rebuy.
+    If this was the last lot, position goes flat.
+    """
+    if lot_index >= len(state['buys']):
+        logger.error(f"record_lot_sell_single: lot_index {lot_index} out of range")
+        return state
+
+    lot = state['buys'][lot_index]
+    qty_sold = lot['qty']
+    buy_price = lot['price']
+
+    MES_POINT_VALUE = 5.0
+    pnl_points = (sell_price - buy_price) * qty_sold
+    pnl_dollars = pnl_points * MES_POINT_VALUE
+
+    if pnl_dollars > 0:
+        reserve_addition = pnl_dollars * profit_reserve_pct
+        state['profit_reserve'] += reserve_addition
+        logger.info(f"Profit reserve +${reserve_addition:.2f} (total: ${state['profit_reserve']:.2f})")
+
+    state['realized_pnl'] += pnl_dollars
+    state['last_sell_price'] = sell_price
+
+    # Remove the sold lot
+    state['buys'].pop(lot_index)
+
+    state = _recalculate(state)
+    state['last_action'] = f"SELL {qty_sold} @ {sell_price:.2f} | PnL: ${pnl_dollars:.2f}"
+    state['last_action_time'] = datetime.now().isoformat()
+    state['last_price'] = sell_price
+
+    logger.info(f"SELL SINGLE {qty_sold} @ {sell_price:.2f} | "
+                f"PnL: ${pnl_dollars:.2f} | Total realized: ${state['realized_pnl']:.2f} | "
+                f"Remaining lots: {len(state['buys'])} | total_qty={state['total_qty']}")
+    return state
+
+
 def record_sell(state, price, qty, profit_reserve_pct):
-    """
-    Records a FULL position close — used for Friday close only.
-    Calculates P&L, sequesters reserve, resets all position fields.
-    """
+    """Full position close — used for Friday close only."""
     if state['average_cost'] is None:
         logger.error("record_sell called but no average_cost in state.")
         return state
@@ -198,7 +204,6 @@ def record_sell(state, price, qty, profit_reserve_pct):
     state['last_action_time'] = datetime.now().isoformat()
     state['last_price'] = price
 
-    # Clear position tracking
     state['buys'] = []
     state['total_qty'] = 0
     state['grid_level'] = 0
@@ -212,10 +217,6 @@ def record_sell(state, price, qty, profit_reserve_pct):
 
 
 def get_unrealized_pnl(state, current_price):
-    """
-    Calculates current unrealized P&L based on average cost vs current price.
-    Returns dollar value.
-    """
     if not state['is_active'] or state['average_cost'] is None:
         return 0.0
     MES_POINT_VALUE = 5.0
@@ -241,12 +242,12 @@ def print_status(state, current_price=None):
     lines.append(f"  Profit Reserve: ${state.get('profit_reserve', 0):.2f}")
     lines.append(f"  Last Action:    {state.get('last_action', '—')}")
 
-    # Show each lot's sell trigger
     if state.get('is_active') and state.get('buys'):
         lines.append("  Lots:")
         for i, lot in enumerate(state['buys']):
             trigger = lot['price'] * (1 + GRID_PCT)
-            lines.append(f"    [{i}] {lot['qty']} @ {lot['price']:.2f} → sell trigger {trigger:.2f}")
+            action = "sell+rebuy" if lot['qty'] >= 2 else "sell only"
+            lines.append(f"    [{i}] {lot['qty']} @ {lot['price']:.2f} → sell {trigger:.2f} ({action})")
     elif state.get('last_sell_price') and not state.get('is_active'):
         reentry = state['last_sell_price'] * (1 - GRID_PCT)
         lines.append(f"  Re-entry At:    {reentry:.2f} (1.2% below sell {state['last_sell_price']:.2f})")
