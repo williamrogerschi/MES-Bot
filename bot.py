@@ -275,9 +275,9 @@ class MESBot:
             if action in (ACTION_BUY_INIT, ACTION_BUY_REENTER, ACTION_BUY_AVG):
                 self._execute_buy(qty)
             elif action == ACTION_SELL_AND_REBUY:
-                self._execute_sell_and_rebuy(qty)  # qty = lot_index
+                self._execute_sell_and_rebuy(qty)
             elif action == ACTION_SELL_SINGLE:
-                self._execute_sell_single(qty)     # qty = lot_index
+                self._execute_sell_single(qty)
             elif action == ACTION_SELL_ALL:
                 self._execute_sell(qty, self.state['grid_level'])
         except Exception as e:
@@ -336,7 +336,7 @@ class MESBot:
             return
 
         lot = self.state['buys'][lot_index]
-        qty_to_sell = lot['qty']  # Should always be 1
+        qty_to_sell = lot['qty']
 
         sell_price = self.broker.sell(qty_to_sell)
         if not sell_price:
@@ -411,13 +411,18 @@ class MESBot:
             if not self._week_opened:
                 logger.info("WEEKLY OPEN: Sunday 5:00 PM ET")
                 if not self.state['is_active']:
+                    # Buy at market regardless of re-entry trigger —
+                    # always want skin in the game at Sunday open
                     self.state['weekend_closed'] = False
+                    self.state['last_sell_price'] = None  # Clear re-entry trigger
                     price = self.broker.buy(INITIAL_QTY)
                     if price:
                         self.state = record_buy(self.state, price, INITIAL_QTY)
                         save_state(self.state)
-                        logger.info(f"Weekly open: 1 @ {price:.2f}")
+                        logger.info(f"Weekly open: 1 @ {price:.2f} (re-entry trigger cleared)")
                         print_status(self.state, self._last_price)
+                    else:
+                        logger.error("Weekly open buy failed")
                 else:
                     logger.info("Sunday open — already holding, skipping.")
 
