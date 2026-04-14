@@ -23,21 +23,18 @@ class Broker:
         self.ib = IB()
         self.contract = None
         self.ticker = None
-        self._price_callbacks = []   # Functions to call when price updates arrive
+        self._price_callbacks = []
 
     # ----------------------------------------------------------
     # Connection
     # ----------------------------------------------------------
 
     def connect(self):
-        """
-        Connects to IB Gateway. Retries up to 5 times on failure.
-        """
         for attempt in range(1, 6):
             try:
                 logger.info(f"Connecting to IB Gateway at {IB_HOST}:{IB_PORT} (attempt {attempt}/5)...")
                 self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
-                self.ib.reqMarketDataType(1)  # 1 = live data
+                self.ib.reqMarketDataType(1)
                 logger.info("Connected to IB Gateway.")
                 self._setup_contract()
                 return True
@@ -57,9 +54,6 @@ class Broker:
         return self.ib.isConnected()
 
     def reconnect_if_needed(self):
-        """
-        Called periodically in the main loop to ensure connection stays alive.
-        """
         if not self.ib.isConnected():
             logger.warning("Connection lost — attempting reconnect...")
             self.connect()
@@ -69,10 +63,6 @@ class Broker:
     # ----------------------------------------------------------
 
     def _setup_contract(self):
-        """
-        Defines the MES futures contract and qualifies it with IBKR.
-        Qualification fills in missing fields (conId, tradingClass, etc.)
-        """
         contract = Future(
             symbol=SYMBOL,
             lastTradeDateOrContractMonth=CONTRACT_EXPIRY,
@@ -93,23 +83,13 @@ class Broker:
     # ----------------------------------------------------------
 
     def start_price_stream(self, callback):
-        """
-        Subscribes to real-time price ticks for the MES contract.
-        Calls `callback(price)` every time a new trade price arrives.
-        Also hooks into portfolio updates as a backup price source.
-        """
         self._price_callbacks.append(callback)
         self.ticker = self.ib.reqMktData(self.contract, '233', False, False)
         self.ticker.updateEvent += self._on_price_update
-        # Portfolio updates fire every ~3 min and serve as backup price source
         self.ib.updatePortfolioEvent += self._on_portfolio_update
         logger.info(f"Price stream started for {self.contract.localSymbol}")
 
     def _on_price_update(self, ticker):
-        """
-        Internal handler for price tick events.
-        Fires registered callbacks with the latest trade price.
-        """
         price = ticker.last
         if price and price > 0:
             for cb in self._price_callbacks:
@@ -119,10 +99,6 @@ class Broker:
                     logger.error(f"Error in price callback: {e}")
 
     def _on_portfolio_update(self, item):
-        """
-        Price source from portfolio update events (~3 min intervals).
-        Always fires callbacks for MES — duplicate updates are harmless.
-        """
         if (item.contract.symbol == self.contract.symbol and
                 item.marketPrice and item.marketPrice > 0):
             for cb in self._price_callbacks:
@@ -132,14 +108,9 @@ class Broker:
                     logger.error(f"Error in portfolio price callback: {e}")
 
     def get_current_price(self):
-        """
-        Returns the latest known price synchronously.
-        Used for startup reconciliation and order confirmation.
-        """
         if self.ticker and self.ticker.last and self.ticker.last > 0:
             return self.ticker.last
 
-        # Fallback: request a snapshot
         ticker = self.ib.reqMktData(self.contract, '', True, False)
         self.ib.sleep(2)
         price = ticker.last or ticker.close
@@ -156,7 +127,11 @@ class Broker:
     def buy(self, qty):
         """
         Places a market buy order for `qty` contracts.
-        Returns the filled price, or None if order failed.
+        Returns the filled price, or None if order failed/timed out.
+
+        IMPORTANT: Always checks fill status before cancelling.
+        A market order that appears to time out may already be filled —
+        cancelling after a fill causes a double-buy on the next tick.
         """
         if not self.contract:
             logger.error("Cannot place buy — contract not set up.")
@@ -175,10 +150,23 @@ class Broker:
                 logger.info(f"BUY filled: {qty} @ {filled_price:.2f}")
                 return filled_price
 
-        # Cancel the order so it doesn't fill later as a GTC orphan
+        # Timeout — check fill status one final time before cancelling.
+        # Market orders frequently fill during the cancel window; returning
+        # None here would cause a duplicate buy on the next price tick.
+        if trade.orderStatus.status == 'Filled':
+            filled_price = trade.orderStatus.avgFillPrice
+            logger.info(f"BUY filled (detected at timeout): {qty} @ {filled_price:.2f}")
+            return filled_price
+
+        if trade.orderStatus.filled > 0:
+            filled_price = trade.orderStatus.avgFillPrice
+            logger.warning(f"BUY partially filled at timeout: {trade.orderStatus.filled} @ {filled_price:.2f} — treating as filled")
+            return filled_price
+
+        # Genuinely unfilled — cancel to prevent GTC orphan
         try:
             self.ib.cancelOrder(trade.order)
-            logger.warning(f"BUY order timed out — cancelled to prevent GTC orphan.")
+            logger.warning("BUY order timed out unfilled — cancelled to prevent GTC orphan.")
         except Exception as e:
             logger.error(f"Failed to cancel timed-out BUY order: {e}")
         return None
@@ -186,7 +174,9 @@ class Broker:
     def sell(self, qty):
         """
         Places a market sell order for `qty` contracts.
-        Returns the filled price, or None if order failed.
+        Returns the filled price, or None if order failed/timed out.
+
+        IMPORTANT: Always checks fill status before cancelling.
         """
         if not self.contract:
             logger.error("Cannot place sell — contract not set up.")
@@ -205,20 +195,26 @@ class Broker:
                 logger.info(f"SELL filled: {qty} @ {filled_price:.2f}")
                 return filled_price
 
-        # Cancel the order so it doesn't fill later as a GTC orphan
+        # Timeout — check fill status one final time before cancelling
+        if trade.orderStatus.status == 'Filled':
+            filled_price = trade.orderStatus.avgFillPrice
+            logger.info(f"SELL filled (detected at timeout): {qty} @ {filled_price:.2f}")
+            return filled_price
+
+        if trade.orderStatus.filled > 0:
+            filled_price = trade.orderStatus.avgFillPrice
+            logger.warning(f"SELL partially filled at timeout: {trade.orderStatus.filled} @ {filled_price:.2f} — treating as filled")
+            return filled_price
+
+        # Genuinely unfilled — cancel to prevent GTC orphan
         try:
             self.ib.cancelOrder(trade.order)
-            logger.warning(f"SELL order timed out — cancelled to prevent GTC orphan.")
+            logger.warning("SELL order timed out unfilled — cancelled to prevent GTC orphan.")
         except Exception as e:
             logger.error(f"Failed to cancel timed-out SELL order: {e}")
         return None
 
     def close_all_positions(self):
-        """
-        Emergency close — sells all open MES positions at market.
-        Used for Friday close and manual override.
-        Returns filled price or None.
-        """
         positions = self.get_open_positions()
         if not positions:
             logger.info("close_all_positions called but no open positions found.")
@@ -233,11 +229,6 @@ class Broker:
     # ----------------------------------------------------------
 
     def get_open_positions(self):
-        """
-        Returns list of open MES positions from IBKR.
-        Format: [{"symbol": "MES", "qty": 2, "avg_cost": 5400.0}]
-        Used on restart to reconcile bot state with reality.
-        """
         positions = []
         for pos in self.ib.positions():
             if (pos.contract.symbol == SYMBOL and
@@ -251,9 +242,6 @@ class Broker:
         return positions
 
     def get_account_value(self):
-        """
-        Returns net liquidation value of the paper trading account.
-        """
         for av in self.ib.accountValues():
             if av.tag == 'NetLiquidation' and av.currency == 'USD':
                 try:
@@ -267,8 +255,4 @@ class Broker:
     # ----------------------------------------------------------
 
     def run_loop(self):
-        """
-        Runs the ib_insync event loop — call this to process
-        incoming data and events. Used in the main bot loop.
-        """
         self.ib.sleep(0)

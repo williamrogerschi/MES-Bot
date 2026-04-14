@@ -72,7 +72,6 @@ def now_et():
 _print_lock = threading.Lock()
 
 def print_status(state, current_price=None):
-    """Builds the full status block as one string and prints atomically."""
     from config import GRID_PCT
     lines = []
     lines.append("\n" + "="*52)
@@ -96,7 +95,6 @@ def print_status(state, current_price=None):
     lines.append(f"  Profit Reserve: ${state.get('profit_reserve', 0.0):.2f}")
     lines.append(f"  Last Action:    {state.get('last_action', '—')}")
 
-    # Show each lot's individual sell trigger
     if state.get('is_active') and state.get('buys'):
         lines.append("  Lots:")
         for i, lot in enumerate(state['buys']):
@@ -132,9 +130,7 @@ def reconcile_state_with_broker(state, broker):
         logger.info(f"Reconciliation OK: both show {live_qty} contracts held.")
         return state
 
-    logger.warning(
-        f"MISMATCH: state={saved_qty} contracts, IBKR={live_qty} contracts."
-    )
+    logger.warning(f"MISMATCH: state={saved_qty} contracts, IBKR={live_qty} contracts.")
 
     if live_qty == 0:
         logger.warning("IBKR is flat — resetting state.")
@@ -170,10 +166,6 @@ class MESBot:
         self._weekend_closed    = False
         self._week_opened       = False
 
-    # ----------------------------------------------------------
-    # Startup
-    # ----------------------------------------------------------
-
     def start(self):
         logger.info("="*52)
         logger.info("  MES Grid Bot Starting")
@@ -191,15 +183,51 @@ class MESBot:
 
         print_status(self.state, price)
 
-        # Immediate entry check on startup if flat
         if not self.state['is_active'] and price:
             logger.info("Flat on startup — checking entry conditions.")
+
             if self.state.get('weekend_closed', False):
+                # Post-weekend restart via Friday close
                 self.state['weekend_closed'] = False
                 save_state(self.state)
                 self._action_queue.put((ACTION_BUY_INIT, INITIAL_QTY, "Post-weekend restart — entering immediately"))
                 self._pending_action = True
                 logger.info("Post-weekend restart — queued immediate BUY_INIT")
+
+            elif self.state.get('last_sell_price') and now_et().weekday() in (0, 1, 2, 3, 4):
+                # Only override re-entry trigger if the sell happened in a PREVIOUS week.
+                # If it happened this week, respect the trigger and wait for the dip.
+                sell_from_previous_week = False
+                last_action_time = self.state.get('last_action_time')
+                if last_action_time:
+                    try:
+                        sell_dt = datetime.fromisoformat(last_action_time)
+                        now = now_et()
+                        # ISO week number comparison
+                        sell_week = sell_dt.isocalendar()[1]
+                        sell_year = sell_dt.isocalendar()[0]
+                        now_week  = now.isocalendar()[1]
+                        now_year  = now.isocalendar()[0]
+                        sell_from_previous_week = (sell_year, sell_week) < (now_year, now_week)
+                    except Exception as e:
+                        logger.warning(f"Could not parse last_action_time: {e} — defaulting to wait for re-entry")
+
+                if sell_from_previous_week:
+                    logger.info(
+                        f"Flat on weekday with stale re-entry trigger from previous week "
+                        f"({self.state['last_sell_price']:.2f}) — buying at market and resetting"
+                    )
+                    self.state['last_sell_price'] = None
+                    save_state(self.state)
+                    self._action_queue.put((ACTION_BUY_INIT, INITIAL_QTY, "New week startup — missed re-entry, buying at market"))
+                    self._pending_action = True
+                else:
+                    logger.info(
+                        f"Flat with re-entry trigger from this week "
+                        f"({self.state['last_sell_price']:.2f} → {self.state['last_sell_price'] * 0.988:.2f}) "
+                        f"— waiting for dip"
+                    )
+
             else:
                 action, qty, reason = evaluate(self.state, price)
                 if action in (ACTION_BUY_INIT, ACTION_BUY_REENTER):
@@ -213,10 +241,6 @@ class MESBot:
         logger.info("Bot running. Press Ctrl+C to stop.")
 
         self._run_loop()
-
-    # ----------------------------------------------------------
-    # Main Loop
-    # ----------------------------------------------------------
 
     def _run_loop(self):
         try:
@@ -236,10 +260,6 @@ class MESBot:
             logger.info("Ctrl+C received — shutting down.")
             self._shutdown()
 
-    # ----------------------------------------------------------
-    # Price Callback — queue only, never trade directly
-    # ----------------------------------------------------------
-
     def _on_price_tick(self, price):
         self._last_price      = price
         self._last_price_time = now_et()
@@ -258,10 +278,6 @@ class MESBot:
         self._action_queue.put((action, qty, reason))
         self._pending_action = True
         logger.info(f"Queued: {action} x{qty} | {reason}")
-
-    # ----------------------------------------------------------
-    # Action Queue Processor
-    # ----------------------------------------------------------
 
     def _process_action_queue(self):
         try:
@@ -285,10 +301,6 @@ class MESBot:
         finally:
             self._pending_action = False
 
-    # ----------------------------------------------------------
-    # Order Execution
-    # ----------------------------------------------------------
-
     def _execute_buy(self, qty):
         filled_price = self.broker.buy(qty)
         if filled_price:
@@ -300,7 +312,6 @@ class MESBot:
             logger.error(f"Buy failed for {qty} contracts — will retry on next tick")
 
     def _execute_sell_and_rebuy(self, lot_index):
-        """Sell an averaged-down lot (qty>=2) and immediately rebuy 1."""
         if lot_index >= len(self.state['buys']):
             logger.error(f"Lot index {lot_index} out of range — skipping")
             return
@@ -330,7 +341,6 @@ class MESBot:
         print_status(self.state, self._last_price)
 
     def _execute_sell_single(self, lot_index):
-        """Sell a single contract lot with no rebuy."""
         if lot_index >= len(self.state['buys']):
             logger.error(f"Lot index {lot_index} out of range — skipping")
             return
@@ -368,10 +378,6 @@ class MESBot:
             print_status(self.state, self._last_price)
         else:
             logger.error(f"Sell failed for {qty} contracts")
-
-    # ----------------------------------------------------------
-    # Weekly Schedule
-    # ----------------------------------------------------------
 
     def _check_schedule(self):
         now = now_et()
@@ -411,10 +417,9 @@ class MESBot:
             if not self._week_opened:
                 logger.info("WEEKLY OPEN: Sunday 5:00 PM ET")
                 if not self.state['is_active']:
-                    # Buy at market regardless of re-entry trigger —
-                    # always want skin in the game at Sunday open
+                    # Always buy at Sunday open regardless of re-entry trigger
                     self.state['weekend_closed'] = False
-                    self.state['last_sell_price'] = None  # Clear re-entry trigger
+                    self.state['last_sell_price'] = None
                     price = self.broker.buy(INITIAL_QTY)
                     if price:
                         self.state = record_buy(self.state, price, INITIAL_QTY)
@@ -428,10 +433,6 @@ class MESBot:
 
                 self._week_opened    = True
                 self._weekend_closed = False
-
-    # ----------------------------------------------------------
-    # Shutdown
-    # ----------------------------------------------------------
 
     def _shutdown(self):
         logger.info("Shutting down — saving state...")
