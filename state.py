@@ -67,6 +67,15 @@ def reset_state():
 
 def _recalculate(state):
     """Recalculate derived fields from buys list."""
+    # Defensive: drop any malformed lots (missing price/qty). A single bad
+    # entry must never crash _recalculate — that failure mode leaves the
+    # state perpetually 'flat' and triggers infinite re-buys.
+    clean = [b for b in state['buys']
+             if isinstance(b, dict) and 'price' in b and 'qty' in b]
+    if len(clean) != len(state['buys']):
+        logger.error(f"_recalculate: dropped {len(state['buys']) - len(clean)} malformed lot(s)")
+        state['buys'] = clean
+
     if not state['buys']:
         state['lowest_buy_price'] = None
         state['average_cost'] = None
@@ -183,8 +192,60 @@ def record_lot_sell_single(state, lot_index, sell_price, profit_reserve_pct):
     return state
 
 
+def record_partial_sell_fifo(state, sell_price, profit_reserve_pct):
+    """
+    Sell exactly ONE contract from the OLDEST lot (FIFO).
+    Used by the Friday close when the position is RED and holds 2+ contracts.
+
+    In an averaging-DOWN grid, buys[0] is the initial entry at the highest
+    price — i.e. the contract furthest underwater. Selling one contract from
+    it realizes the worst single-contract loss and pulls average cost down.
+
+    If the oldest lot has qty > 1, it is split: qty decremented by 1, the lot
+    stays. If the oldest lot has qty == 1, the lot is removed entirely.
+
+    Position remains active afterward (caller guarantees 2+ contracts held).
+    """
+    if not state['buys']:
+        logger.error("record_partial_sell_fifo: no lots to sell")
+        return state
+
+    lot = state['buys'][0]              # oldest = furthest in the hole
+    buy_price = lot['price']
+
+    MES_POINT_VALUE = 5.0
+    pnl_points = (sell_price - buy_price) * 1     # selling exactly 1 contract
+    pnl_dollars = pnl_points * MES_POINT_VALUE
+
+    if pnl_dollars > 0:
+        reserve_addition = pnl_dollars * profit_reserve_pct
+        state['profit_reserve'] += reserve_addition
+        logger.info(f"Profit reserve +${reserve_addition:.2f} (total: ${state['profit_reserve']:.2f})")
+
+    state['realized_pnl'] += pnl_dollars
+
+    # Split or remove the oldest lot
+    if lot['qty'] > 1:
+        lot['qty'] -= 1                 # keep the lot, drop one contract
+    else:
+        state['buys'].pop(0)            # single-contract lot — remove it
+
+    state = _recalculate(state)
+    state['last_action'] = f"FRI PARTIAL SELL 1 @ {sell_price:.2f} | PnL: ${pnl_dollars:.2f}"
+    state['last_action_time'] = datetime.now().isoformat()
+    state['last_price'] = sell_price
+
+    logger.info(
+        f"FRIDAY PARTIAL SELL 1 @ {sell_price:.2f} (from oldest lot @ {buy_price:.2f}) | "
+        f"PnL: ${pnl_dollars:.2f} | Total realized: ${state['realized_pnl']:.2f} | "
+        f"Remaining lots: {len(state['buys'])} | total_qty={state['total_qty']} | "
+        f"grid_level={state['grid_level']}"
+    )
+    return state
+
+
 def record_sell(state, price, qty, profit_reserve_pct):
-    """Full position close — used for Friday close only."""
+    """Full position close — used for Friday close and contract roll."""
     if state['average_cost'] is None:
         logger.error("record_sell called but no average_cost in state.")
         return state

@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py — Main Bot Loop (v5 — thread-safe status printing)
+# bot.py — Main Bot Loop (v6 — three-branch Friday close + quarterly roll)
 # ============================================================
 
 import logging
@@ -7,7 +7,7 @@ import time
 import sys
 import queue
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 from config import (
@@ -25,8 +25,10 @@ from strategy import (
 from state import (
     load_state, save_state, reset_state,
     record_buy, record_sell, record_lot_sell_and_rebuy,
-    record_lot_sell_single, get_unrealized_pnl
+    record_lot_sell_single, record_partial_sell_fifo,
+    get_unrealized_pnl
 )
+import contract_roll as cr
 
 # ── Logging Setup ─────────────────────────────────────────────
 def setup_logging():
@@ -170,10 +172,30 @@ class MESBot:
         logger.info("="*52)
         logger.info("  MES Grid Bot Starting")
         logger.info("="*52)
+        logger.info(cr.describe(now_et().date()))
 
-        if not self.broker.connect():
-            logger.error("Cannot start — failed to connect to IB Gateway.")
-            sys.exit(1)
+        # Startup connect. For no-touch deployment, if IB Gateway isn't up yet
+        # (e.g. machine just rebooted and Gateway is still launching), wait and
+        # keep trying rather than exiting — exiting would just bounce the
+        # supervisor in a fast restart loop. Backoff caps at 60s between rounds.
+        startup_delay = 5.0
+        while not self.broker.connect():
+            logger.warning(
+                f"IB Gateway not available at startup — retrying in {startup_delay:.0f}s. "
+                f"(Is IB Gateway/TWS running with the API port open?)"
+            )
+            time.sleep(startup_delay)
+            startup_delay = min(startup_delay * 2.0, 60.0)
+
+        # Ensure the broker is on the correct front-month contract. If the
+        # machine was off across a roll boundary, switch before reconciling.
+        expected_expiry = cr.contract_expiry_str(now_et().date())
+        if self.broker.current_expiry_str() != expected_expiry:
+            logger.warning(
+                f"Startup: broker on {self.broker.current_expiry_str()}, "
+                f"resolver expects {expected_expiry} — switching contract."
+            )
+            self.broker.set_contract(expected_expiry)
 
         self.state = reconcile_state_with_broker(self.state, self.broker)
 
@@ -196,14 +218,12 @@ class MESBot:
 
             elif self.state.get('last_sell_price') and now_et().weekday() in (0, 1, 2, 3, 4):
                 # Only override re-entry trigger if the sell happened in a PREVIOUS week.
-                # If it happened this week, respect the trigger and wait for the dip.
                 sell_from_previous_week = False
                 last_action_time = self.state.get('last_action_time')
                 if last_action_time:
                     try:
                         sell_dt = datetime.fromisoformat(last_action_time)
                         now = now_et()
-                        # ISO week number comparison
                         sell_week = sell_dt.isocalendar()[1]
                         sell_year = sell_dt.isocalendar()[0]
                         now_week  = now.isocalendar()[1]
@@ -243,8 +263,8 @@ class MESBot:
         self._run_loop()
 
     def _run_loop(self):
-        try:
-            while self.running:
+        while self.running:
+            try:
                 self.broker.run_loop()
                 self._process_action_queue()
                 self._check_schedule()
@@ -256,28 +276,41 @@ class MESBot:
 
                 time.sleep(1)
 
-        except KeyboardInterrupt:
-            logger.info("Ctrl+C received — shutting down.")
-            self._shutdown()
+            except KeyboardInterrupt:
+                logger.info("Ctrl+C received — shutting down.")
+                self._shutdown()
+                return
+
+            except Exception as e:
+                # A single bad cycle must NOT kill the bot. Log it and keep
+                # looping — next cycle will reconnect/reconcile as needed.
+                # (The circuit breaker in _execute_buy still halts on the one
+                # condition where continuing would be dangerous.)
+                logger.error(f"Loop cycle error (continuing): {type(e).__name__}: {e}")
+                time.sleep(1)
 
     def _on_price_tick(self, price):
-        self._last_price      = price
-        self._last_price_time = now_et()
+        try:
+            self._last_price      = price
+            self._last_price_time = now_et()
 
-        if self._pending_action:
-            return
+            if self._pending_action:
+                return
 
-        action, qty, reason = evaluate(self.state, price)
+            action, qty, reason = evaluate(self.state, price)
 
-        if action == ACTION_NONE:
-            return
-        if action == ACTION_HOLD:
-            logger.debug(f"HOLD: {reason}")
-            return
+            if action == ACTION_NONE:
+                return
+            if action == ACTION_HOLD:
+                logger.debug(f"HOLD: {reason}")
+                return
 
-        self._action_queue.put((action, qty, reason))
-        self._pending_action = True
-        logger.info(f"Queued: {action} x{qty} | {reason}")
+            self._action_queue.put((action, qty, reason))
+            self._pending_action = True
+            logger.info(f"Queued: {action} x{qty} | {reason}")
+        except Exception as e:
+            # Never let a bad tick propagate and kill the stream/process.
+            logger.error(f"Price tick error (ignored): {type(e).__name__}: {e}")
 
     def _process_action_queue(self):
         try:
@@ -304,8 +337,23 @@ class MESBot:
     def _execute_buy(self, qty):
         filled_price = self.broker.buy(qty)
         if filled_price:
+            prev_qty = self.state.get('total_qty', 0)
             self.state = record_buy(self.state, filled_price, qty)
             save_state(self.state)
+
+            # Circuit breaker: a buy filled, so the position MUST now be active
+            # with a larger qty. If it isn't, the state write failed (e.g. a
+            # corrupt lot) — halt rather than let the flat state trigger an
+            # infinite re-buy loop on the next tick.
+            if not self.state.get('is_active') or self.state.get('total_qty', 0) <= prev_qty:
+                logger.error(
+                    f"FATAL: buy filled @ {filled_price:.2f} but state did not register "
+                    f"(is_active={self.state.get('is_active')}, total_qty={self.state.get('total_qty')}). "
+                    f"Halting bot to prevent runaway buying. Check TWS position and state.json."
+                )
+                self.running = False
+                return
+
             logger.info(f"✅ BUY {qty} @ {filled_price:.2f}")
             print_status(self.state, self._last_price)
         else:
@@ -379,36 +427,27 @@ class MESBot:
         else:
             logger.error(f"Sell failed for {qty} contracts")
 
+    # ----------------------------------------------------------------
     def _check_schedule(self):
         now = now_et()
 
         if should_close_for_weekend(now):
             if not self._weekend_closed:
-                logger.info("WEEKLY CLOSE: Friday 3:59:55 PM ET")
+                # Clear queued actions / pending flag first.
                 while not self._action_queue.empty():
                     self._action_queue.get_nowait()
                 self._pending_action = False
 
-                if self.state['is_active']:
-                    filled = self.broker.close_all_positions()
-                    if filled:
-                        self.state = record_sell(
-                            self.state, filled,
-                            self.state['total_qty'], PROFIT_RESERVE_PCT
-                        )
-                        self.state['last_sell_price'] = filled
-                        self.state['weekend_closed'] = True
-                        save_state(self.state)
-                        logger.info(
-                            f"Weekly close done. "
-                            f"PnL: ${self.state['realized_pnl']:.2f} | "
-                            f"Reserve: ${self.state['profit_reserve']:.2f}"
-                        )
-                        print_status(self.state, self._last_price)
-                    else:
-                        logger.error("Friday close FAILED — will retry next tick")
+                # ROLL takes priority over the normal weekly close.
+                if cr.is_roll_day(now.date()):
+                    logger.info("ROLL DAY: Friday 3:59:55 PM ET — contract roll")
+                    self._handle_contract_roll()
                 else:
-                    logger.info("Friday close — no active position.")
+                    logger.info("WEEKLY CLOSE: Friday 3:59:55 PM ET")
+                    if self.state['is_active']:
+                        self._handle_friday_close()
+                    else:
+                        logger.info("Friday close — no active position.")
 
                 self._weekend_closed = True
                 self._week_opened    = False
@@ -417,7 +456,8 @@ class MESBot:
             if not self._week_opened:
                 logger.info("WEEKLY OPEN: Sunday 5:00 PM ET")
                 if not self.state['is_active']:
-                    # Always buy at Sunday open regardless of re-entry trigger
+                    # Flat (flattened green on Friday, or never held) —
+                    # always buy 1 at Sunday open, clear any re-entry trigger.
                     self.state['weekend_closed'] = False
                     self.state['last_sell_price'] = None
                     price = self.broker.buy(INITIAL_QTY)
@@ -429,11 +469,141 @@ class MESBot:
                     else:
                         logger.error("Weekly open buy failed")
                 else:
-                    logger.info("Sunday open — already holding, skipping.")
+                    # Position held over the weekend (red Friday close or a
+                    # rolled position). Resume grid — do NOT add a contract.
+                    logger.info(
+                        f"Sunday open — holding {self.state['total_qty']} contract(s) "
+                        f"carried over from Friday. Resuming grid, no new buy."
+                    )
+                    self.state['weekend_closed'] = False
+                    save_state(self.state)
 
                 self._week_opened    = True
                 self._weekend_closed = False
 
+    # ----------------------------------------------------------------
+    def _handle_friday_close(self):
+        """
+        Normal Friday close (NON-roll weeks). Three branches:
+
+          1. GREEN (uPnL >= 0)          → flatten all. Sunday rebuys 1.
+          2. RED and 2+ contracts       → sell 1 FIFO (oldest/furthest under),
+                                          hold the rest over the weekend.
+          3. RED and exactly 1 contract → hold the single contract.
+        """
+        price = self._last_price
+        if price is None:
+            logger.error("Friday close — no price available. Retry next tick.")
+            self._weekend_closed = False
+            return
+
+        upnl = get_unrealized_pnl(self.state, price)
+        total_qty = self.state['total_qty']
+
+        # Branch 1: GREEN — flatten
+        if upnl >= 0:
+            logger.info(f"Friday close — GREEN (uPnL ${upnl:.2f}) — flattening {total_qty} contract(s).")
+            filled = self.broker.close_all_positions()
+            if filled:
+                self.state = record_sell(self.state, filled, total_qty, PROFIT_RESERVE_PCT)
+                self.state['last_sell_price'] = filled
+                self.state['weekend_closed'] = True
+                save_state(self.state)
+                logger.info(f"Friday GREEN close done. Realized ${self.state['realized_pnl']:.2f}")
+                print_status(self.state, price)
+            else:
+                logger.error("Friday GREEN close FAILED — retry next tick")
+                self._weekend_closed = False
+            return
+
+        # Branch 2: RED with 2+ — sell 1 FIFO, hold rest
+        if total_qty >= 2:
+            logger.info(
+                f"Friday close — RED (uPnL ${upnl:.2f}) with {total_qty} — "
+                f"selling 1 FIFO, holding {total_qty - 1} over weekend."
+            )
+            filled = self.broker.sell(1)
+            if filled:
+                self.state = record_partial_sell_fifo(self.state, filled, PROFIT_RESERVE_PCT)
+                self.state['weekend_closed'] = False
+                save_state(self.state)
+                logger.info(f"Friday RED partial done. Holding {self.state['total_qty']} over weekend.")
+                print_status(self.state, price)
+            else:
+                logger.error("Friday RED partial sell FAILED — retry next tick")
+                self._weekend_closed = False
+            return
+
+        # Branch 3: RED with 1 — hold
+        logger.info(f"Friday close — RED (uPnL ${upnl:.2f}) with 1 contract — holding over weekend.")
+        self.state['weekend_closed'] = False
+        save_state(self.state)
+        print_status(self.state, price)
+
+    # ----------------------------------------------------------------
+    def _handle_contract_roll(self):
+        """
+        ROLL DAY (second Friday of expiry month, at the Friday close).
+
+        Close ALL contracts in the expiring contract, then IMMEDIATELY
+        reopen the SAME number in the new front-month contract — regardless
+        of green/red. Position size carries across the weekend in the new
+        contract. The grid ladder resets to a single lot at the new price.
+        """
+        old_expiry = self.broker.current_expiry_str()
+        new_expiry = cr.contract_expiry_str(now_et().date() + timedelta(days=1))
+
+        qty_to_carry = self.state['total_qty'] if self.state['is_active'] else 0
+
+        # 1) Close everything in the OLD contract.
+        if self.state['is_active']:
+            filled = self.broker.close_all_positions()
+            if not filled:
+                logger.error("ROLL: close of old contract FAILED — will retry next tick")
+                self._weekend_closed = False
+                return
+            self.state = record_sell(
+                self.state, filled, self.state['total_qty'], PROFIT_RESERVE_PCT
+            )
+            self.state['last_sell_price'] = filled
+            logger.info(
+                f"ROLL: closed {qty_to_carry} contract(s) of {old_expiry} @ {filled:.2f} | "
+                f"Realized: ${self.state['realized_pnl']:.2f}"
+            )
+
+        # 2) Point the broker at the NEW contract.
+        if not self.broker.set_contract(new_expiry):
+            logger.error(f"ROLL: failed to switch broker to {new_expiry} — position FLAT, manual check needed")
+            save_state(self.state)
+            return
+        logger.info(f"ROLL: broker now on contract {new_expiry} (was {old_expiry})")
+
+        # 3) Reopen the SAME size in the new contract (if we were holding).
+        if qty_to_carry > 0:
+            rebuy_price = self.broker.buy(qty_to_carry)
+            if not rebuy_price:
+                logger.error(
+                    f"ROLL: reopen of {qty_to_carry} in {new_expiry} FAILED — "
+                    f"position FLAT in new contract, manual intervention needed"
+                )
+                save_state(self.state)
+                return
+            self.state = record_buy(self.state, rebuy_price, qty_to_carry)
+            self.state['weekend_closed'] = False
+            self.state['last_sell_price'] = None
+            save_state(self.state)
+            logger.info(
+                f"ROLL COMPLETE: reopened {qty_to_carry} @ {rebuy_price:.2f} in {new_expiry}. "
+                f"Grid ladder reset to single lot. Holding over weekend."
+            )
+            print_status(self.state, rebuy_price)
+        else:
+            self.state['weekend_closed'] = False
+            save_state(self.state)
+            logger.info(f"ROLL COMPLETE: was flat, broker switched to {new_expiry}. Sunday opens fresh.")
+            print_status(self.state, self._last_price)
+
+    # ----------------------------------------------------------------
     def _shutdown(self):
         logger.info("Shutting down — saving state...")
         save_state(self.state)

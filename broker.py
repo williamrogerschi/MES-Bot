@@ -9,8 +9,9 @@ import time
 from ib_insync import IB, Future, MarketOrder, util
 from config import (
     IB_HOST, IB_PORT, IB_CLIENT_ID,
-    SYMBOL, EXCHANGE, CURRENCY, CONTRACT_TYPE, CONTRACT_EXPIRY
+    SYMBOL, EXCHANGE, CURRENCY, CONTRACT_TYPE
 )
+import contract_roll as cr
 
 logger = logging.getLogger(__name__)
 
@@ -24,25 +25,42 @@ class Broker:
         self.contract = None
         self.ticker = None
         self._price_callbacks = []
+        # Active expiry is date-driven, not hardcoded. Source of truth is
+        # contract_roll; config no longer carries the expiry.
+        self.expiry_str = cr.contract_expiry_str()
+        # Reconnect backoff state. When disconnected, attempts are spaced out
+        # with exponential backoff (capped) instead of spinning every loop.
+        self._reconnect_next_time = 0.0      # epoch seconds; 0 = attempt allowed now
+        self._reconnect_delay = 0.0          # current backoff delay in seconds
 
     # ----------------------------------------------------------
     # Connection
     # ----------------------------------------------------------
 
-    def connect(self):
-        for attempt in range(1, 6):
+    def connect(self, max_attempts=5):
+        """
+        Connect to IB Gateway. Tries up to max_attempts times with a short
+        gap between tries. Returns True on success, False if all fail.
+        Used both for the initial startup connect (max_attempts=5) and, with
+        max_attempts=1, for the spaced-out reconnect path.
+        """
+        for attempt in range(1, max_attempts + 1):
             try:
-                logger.info(f"Connecting to IB Gateway at {IB_HOST}:{IB_PORT} (attempt {attempt}/5)...")
+                logger.info(f"Connecting to IB Gateway at {IB_HOST}:{IB_PORT} (attempt {attempt}/{max_attempts})...")
                 self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
                 self.ib.reqMarketDataType(1)
                 logger.info("Connected to IB Gateway.")
                 self._setup_contract()
+                # Reset backoff on any successful connect.
+                self._reconnect_delay = 0.0
+                self._reconnect_next_time = 0.0
                 return True
             except Exception as e:
                 logger.warning(f"Connection attempt {attempt} failed: {e}")
-                time.sleep(5)
+                if attempt < max_attempts:
+                    time.sleep(5)
 
-        logger.error("Could not connect to IB Gateway after 5 attempts. Is it running?")
+        logger.error(f"Could not connect to IB Gateway after {max_attempts} attempt(s).")
         return False
 
     def disconnect(self):
@@ -54,29 +72,128 @@ class Broker:
         return self.ib.isConnected()
 
     def reconnect_if_needed(self):
-        if not self.ib.isConnected():
-            logger.warning("Connection lost — attempting reconnect...")
-            self.connect()
+        """
+        Called every main-loop cycle. If disconnected, attempts ONE reconnect
+        but only after the current backoff delay has elapsed — so an extended
+        broker outage results in calm, spaced retries (5s, 10s, 20s, 40s, then
+        capped at 60s) instead of spinning connect() continuously and starving
+        the machine of resources.
+
+        On a successful reconnect it re-arms the price stream so ticks resume.
+        Returns True if connected (already or freshly), False if still down.
+        """
+        if self.ib.isConnected():
+            return True
+
+        now = time.time()
+        if now < self._reconnect_next_time:
+            # Still inside the backoff window — do nothing this cycle.
+            return False
+
+        logger.warning(
+            f"Connection lost — reconnect attempt (backoff {self._reconnect_delay:.0f}s)..."
+        )
+        ok = self.connect(max_attempts=1)
+
+        if ok:
+            logger.info("Reconnected to IB Gateway.")
+            # Re-arm BOTH feeds, matching start_price_stream: the ticker stream
+            # and the portfolio update event. Re-adding an event handler that's
+            # still attached is harmless (ib_insync dedups), but after a real
+            # disconnect they need re-subscribing so ticks AND portfolio updates
+            # both resume.
+            try:
+                if self._price_callbacks:
+                    self.ticker = self.ib.reqMktData(self.contract, '233', False, False)
+                    self.ticker.updateEvent += self._on_price_update
+                    self.ib.updatePortfolioEvent += self._on_portfolio_update
+                    logger.info(f"Price stream re-armed for {self.contract.localSymbol}")
+            except Exception as e:
+                logger.error(f"Reconnect: failed to re-arm price stream: {e}")
+            return True
+
+        # Failed — grow the backoff (5 → 10 → 20 → 40 → cap 60) and schedule next.
+        RECONNECT_BACKOFF_CAP = 60.0
+        if self._reconnect_delay <= 0.0:
+            self._reconnect_delay = 5.0
+        else:
+            self._reconnect_delay = min(self._reconnect_delay * 2.0, RECONNECT_BACKOFF_CAP)
+        self._reconnect_next_time = time.time() + self._reconnect_delay
+        logger.warning(f"Reconnect failed — next attempt in {self._reconnect_delay:.0f}s.")
+        return False
 
     # ----------------------------------------------------------
     # Contract Setup
     # ----------------------------------------------------------
 
-    def _setup_contract(self):
+    def _build_contract(self, expiry_str):
+        """Construct and qualify the IBKR Future for a given YYYYMMDD expiry."""
         contract = Future(
             symbol=SYMBOL,
-            lastTradeDateOrContractMonth=CONTRACT_EXPIRY,
+            lastTradeDateOrContractMonth=expiry_str,
             exchange=EXCHANGE,
             currency=CURRENCY
         )
         qualified = self.ib.qualifyContracts(contract)
         if not qualified:
-            raise Exception(f"Could not qualify contract {SYMBOL} {CONTRACT_EXPIRY}. "
+            logger.error(f"Could not qualify contract {SYMBOL} {expiry_str}. "
+                         f"Check the expiry is correct and trading has opened.")
+            return None
+        return qualified[0]
+
+    def _setup_contract(self):
+        contract = self._build_contract(self.expiry_str)
+        if contract is None:
+            raise Exception(f"Could not qualify contract {SYMBOL} {self.expiry_str}. "
                             f"Check that the contract expiry is correct and trading has opened.")
-        self.contract = qualified[0]
+        self.contract = contract
         logger.info(f"Contract qualified: {self.contract.localSymbol} | "
                     f"Exchange: {self.contract.exchange} | "
                     f"Expiry: {self.contract.lastTradeDateOrContractMonth}")
+
+    def current_expiry_str(self):
+        """Return the expiry string the broker is currently trading."""
+        return self.expiry_str
+
+    def set_contract(self, expiry_str):
+        """
+        Switch the broker to a new contract expiry (used at quarterly roll).
+        Cancels the old price subscription, qualifies and arms the new
+        contract, and re-subscribes the existing price callbacks.
+
+        Caller MUST have closed any position in the old contract first —
+        set_contract does not move positions.
+
+        Returns True on success.
+        """
+        if expiry_str == self.expiry_str:
+            logger.info(f"set_contract: already on {expiry_str}, no change.")
+            return True
+
+        new_contract = self._build_contract(expiry_str)
+        if new_contract is None:
+            return False
+
+        # Tear down the old market-data subscription.
+        try:
+            if self.ticker is not None:
+                self.ticker.updateEvent -= self._on_price_update
+                self.ib.cancelMktData(self.contract)
+        except Exception as e:
+            logger.warning(f"set_contract: could not cancel old mkt data cleanly: {e}")
+
+        old = self.expiry_str
+        self.contract = new_contract
+        self.expiry_str = expiry_str
+        logger.info(f"set_contract: switched {old} -> {expiry_str} ({self.contract.localSymbol})")
+
+        # Re-arm the price stream on the new contract if callbacks are present.
+        if self._price_callbacks:
+            self.ticker = self.ib.reqMktData(self.contract, '233', False, False)
+            self.ticker.updateEvent += self._on_price_update
+            logger.info(f"set_contract: price stream re-armed for {self.contract.localSymbol}")
+
+        return True
 
     # ----------------------------------------------------------
     # Price Streaming
@@ -99,7 +216,11 @@ class Broker:
                     logger.error(f"Error in price callback: {e}")
 
     def _on_portfolio_update(self, item):
+        # Match on the ACTIVE contract's expiry, not just the symbol — during
+        # a roll there can be two MES contracts in the portfolio at once, and
+        # we only want price ticks from the one we're currently trading.
         if (item.contract.symbol == self.contract.symbol and
+                item.contract.lastTradeDateOrContractMonth == self.contract.lastTradeDateOrContractMonth and
                 item.marketPrice and item.marketPrice > 0):
             for cb in self._price_callbacks:
                 try:
@@ -229,10 +350,13 @@ class Broker:
     # ----------------------------------------------------------
 
     def get_open_positions(self):
+        # Filter to the ACTIVE contract expiry so a freshly-rolled-out old
+        # contract position (if any lingered) doesn't get mixed in.
         positions = []
         for pos in self.ib.positions():
             if (pos.contract.symbol == SYMBOL and
                     pos.contract.secType == 'FUT' and
+                    pos.contract.lastTradeDateOrContractMonth == self.expiry_str and
                     pos.position != 0):
                 positions.append({
                     "symbol": pos.contract.localSymbol,

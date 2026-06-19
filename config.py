@@ -7,7 +7,7 @@
 # --- IBKR Connection ---
 IB_HOST = '127.0.0.1'       # Localhost — bot and gateway on same machine
 IB_PORT = 7497               # 4002 = IB Gateway paper | 7497 = TWS paper
-IB_CLIENT_ID = 11             # Unique ID for this bot connection
+IB_CLIENT_ID = 14             # Unique ID for this bot connection
 
 # --- Contract ---
 SYMBOL = 'MES'               # Micro E-mini S&P 500
