@@ -98,12 +98,24 @@ class Broker:
         if ok:
             logger.info("Reconnected to IB Gateway.")
             # Re-arm BOTH feeds, matching start_price_stream: the ticker stream
-            # and the portfolio update event. Re-adding an event handler that's
-            # still attached is harmless (ib_insync dedups), but after a real
-            # disconnect they need re-subscribing so ticks AND portfolio updates
-            # both resume.
+            # and the portfolio update event. Clean up the OLD subscriptions
+            # first so they don't pile up across reconnects (IBKR caps active
+            # subscriptions; leaking them eventually throws Error 322 and can
+            # multiply tick callbacks).
             try:
                 if self._price_callbacks:
+                    # Cancel any stale market-data line before re-requesting.
+                    try:
+                        self.ib.cancelMktData(self.contract)
+                    except Exception:
+                        pass
+                    # Detach the portfolio handler if already attached, so we
+                    # never stack duplicates (handler firing N times per update).
+                    try:
+                        self.ib.updatePortfolioEvent -= self._on_portfolio_update
+                    except Exception:
+                        pass
+
                     self.ticker = self.ib.reqMktData(self.contract, '233', False, False)
                     self.ticker.updateEvent += self._on_price_update
                     self.ib.updatePortfolioEvent += self._on_portfolio_update
