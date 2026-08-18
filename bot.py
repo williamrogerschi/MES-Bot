@@ -481,8 +481,62 @@ class MESBot:
                 self._week_opened    = True
                 self._weekend_closed = False
 
-    # ----------------------------------------------------------------
-    def _handle_friday_close(self):
+        else:
+            # CATCH-UP: the Sunday-open window (should_open_for_week) is narrow,
+            # so if the process was suspended across it — machine asleep, frozen,
+            # or lagging — the loop never evaluated the window while it was True
+            # and the weekly buy is silently skipped. This branch fires that buy
+            # late, the moment the loop resumes, instead of waiting a full week.
+            #
+            # Conditions (all must hold):
+            #   - flat (no active position)
+            #   - not currently in the weekend-close window
+            #   - haven't already opened this week (_week_opened False)
+            #   - it's Sunday evening or later in the trading week (not mid-close)
+            #   - the last sell (if any) was in a PREVIOUS week — so we don't
+            #     stomp a this-week re-entry trigger the strategy is waiting on
+            # Mirrors the startup post-weekend logic so wake-from-sleep behaves
+            # like a restart for this one purpose.
+            if (not self.state['is_active']
+                    and not self._week_opened
+                    and now.weekday() in (6, 0, 1, 2, 3, 4)  # Sun-Fri trading week
+                    and self._is_new_trading_week(now)):
+                logger.info("MISSED WEEKLY OPEN — catch-up: flat and past Sunday open, "
+                            "buying base position at market.")
+                self.state['weekend_closed'] = False
+                self.state['last_sell_price'] = None
+                price = self.broker.buy(INITIAL_QTY)
+                if price:
+                    self.state = record_buy(self.state, price, INITIAL_QTY)
+                    save_state(self.state)
+                    logger.info(f"Catch-up open: 1 @ {price:.2f} (re-entry trigger cleared)")
+                    print_status(self.state, self._last_price)
+                    self._week_opened = True
+                else:
+                    logger.error("Catch-up weekly open buy failed")
+
+    def _is_new_trading_week(self, now):
+        """True if we've entered a new trading week since the last recorded action.
+        The trading week opens Sunday 5 PM ET, but ISO weeks start Monday — so a
+        Sunday belongs to the ISO week that's ending, not the new trading week.
+        Shift any Sunday forward one day before computing its ISO week so Sunday
+        open groups with the coming Monday. Compares against last_action_time the
+        same way, so a Thursday sell reads as 'previous week' by Sunday evening.
+        No last_action_time → treat as new week (safe: flat and past open)."""
+        def trading_week(dt):
+            # Sunday (weekday 6) counts as the next trading week.
+            shifted = dt + timedelta(days=1) if dt.weekday() == 6 else dt
+            return (shifted.isocalendar()[0], shifted.isocalendar()[1])
+
+        last_action_time = self.state.get('last_action_time')
+        if not last_action_time:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last_action_time)
+            return trading_week(last_dt) < trading_week(now)
+        except Exception as e:
+            logger.warning(f"_is_new_trading_week parse error: {e} — treating as new week")
+            return True
         """
         Normal Friday close (NON-roll weeks). Three branches:
 
