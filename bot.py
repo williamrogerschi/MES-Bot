@@ -1,5 +1,6 @@
 # ============================================================
-# bot.py — Main Bot Loop (v6 — three-branch Friday close + quarterly roll)
+# bot.py — Main Bot Loop (v7 — three-branch Friday close + quarterly roll,
+#          roll now flattens-and-waits for normal Sunday-open re-entry)
 # ============================================================
 
 import logging
@@ -209,7 +210,7 @@ class MESBot:
             logger.info("Flat on startup — checking entry conditions.")
 
             if self.state.get('weekend_closed', False):
-                # Post-weekend restart via Friday close
+                # Post-weekend restart via Friday close (normal flatten OR roll)
                 self.state['weekend_closed'] = False
                 save_state(self.state)
                 self._action_queue.put((ACTION_BUY_INIT, INITIAL_QTY, "Post-weekend restart — entering immediately"))
@@ -456,8 +457,9 @@ class MESBot:
             if not self._week_opened:
                 logger.info("WEEKLY OPEN: Sunday 5:00 PM ET")
                 if not self.state['is_active']:
-                    # Flat (flattened green on Friday, or never held) —
-                    # always buy 1 at Sunday open, clear any re-entry trigger.
+                    # Flat (flattened green on Friday, rolled on Friday, or
+                    # never held) — always buy 1 at Sunday open, clear any
+                    # re-entry trigger.
                     self.state['weekend_closed'] = False
                     self.state['last_sell_price'] = None
                     price = self.broker.buy(INITIAL_QTY)
@@ -469,8 +471,8 @@ class MESBot:
                     else:
                         logger.error("Weekly open buy failed")
                 else:
-                    # Position held over the weekend (red Friday close or a
-                    # rolled position). Resume grid — do NOT add a contract.
+                    # Position held over the weekend (red Friday close).
+                    # Resume grid — do NOT add a contract.
                     logger.info(
                         f"Sunday open — holding {self.state['total_qty']} contract(s) "
                         f"carried over from Friday. Resuming grid, no new buy."
@@ -537,6 +539,8 @@ class MESBot:
         except Exception as e:
             logger.warning(f"_is_new_trading_week parse error: {e} — treating as new week")
             return True
+
+    def _handle_friday_close(self):
         """
         Normal Friday close (NON-roll weeks). Three branches:
 
@@ -599,63 +603,61 @@ class MESBot:
         """
         ROLL DAY (second Friday of expiry month, at the Friday close).
 
-        Close ALL contracts in the expiring contract, then IMMEDIATELY
-        reopen the SAME number in the new front-month contract — regardless
-        of green/red. Position size carries across the weekend in the new
-        contract. The grid ladder resets to a single lot at the new price.
+        Close ALL contracts in the expiring contract and switch the broker
+        to the new front-month contract. Do NOT reopen here — the position
+        stays FLAT over the weekend, exactly like a green Friday close.
+        The normal Sunday-open path (should_open_for_week) — or the
+        post-weekend startup path, via weekend_closed — buys INITIAL_QTY
+        (1 contract) fresh in the new contract, and the grid ladder
+        rebuilds from there like any other week. This happens regardless
+        of red/green PnL, since holding into the new contract without a
+        fresh entry decision doesn't make sense — the old price levels
+        (lot prices, dip trigger, sell triggers) belong to the expiring
+        contract and carry no meaning in the new one.
         """
         old_expiry = self.broker.current_expiry_str()
         new_expiry = cr.contract_expiry_str(now_et().date() + timedelta(days=1))
 
-        qty_to_carry = self.state['total_qty'] if self.state['is_active'] else 0
+        was_active = self.state['is_active']
+        qty_closed = self.state['total_qty'] if was_active else 0
 
         # 1) Close everything in the OLD contract.
-        if self.state['is_active']:
+        if was_active:
             filled = self.broker.close_all_positions()
             if not filled:
                 logger.error("ROLL: close of old contract FAILED — will retry next tick")
                 self._weekend_closed = False
                 return
             self.state = record_sell(
-                self.state, filled, self.state['total_qty'], PROFIT_RESERVE_PCT
+                self.state, filled, qty_closed, PROFIT_RESERVE_PCT
             )
-            self.state['last_sell_price'] = filled
             logger.info(
-                f"ROLL: closed {qty_to_carry} contract(s) of {old_expiry} @ {filled:.2f} | "
+                f"ROLL: closed {qty_closed} contract(s) of {old_expiry} @ {filled:.2f} | "
                 f"Realized: ${self.state['realized_pnl']:.2f}"
             )
+
+        # No re-entry trigger carries over — the old contract's price level
+        # is meaningless in the new contract (different absolute price due
+        # to calendar spread/carry).
+        self.state['last_sell_price'] = None
 
         # 2) Point the broker at the NEW contract.
         if not self.broker.set_contract(new_expiry):
             logger.error(f"ROLL: failed to switch broker to {new_expiry} — position FLAT, manual check needed")
+            self.state['weekend_closed'] = True
             save_state(self.state)
             return
         logger.info(f"ROLL: broker now on contract {new_expiry} (was {old_expiry})")
 
-        # 3) Reopen the SAME size in the new contract (if we were holding).
-        if qty_to_carry > 0:
-            rebuy_price = self.broker.buy(qty_to_carry)
-            if not rebuy_price:
-                logger.error(
-                    f"ROLL: reopen of {qty_to_carry} in {new_expiry} FAILED — "
-                    f"position FLAT in new contract, manual intervention needed"
-                )
-                save_state(self.state)
-                return
-            self.state = record_buy(self.state, rebuy_price, qty_to_carry)
-            self.state['weekend_closed'] = False
-            self.state['last_sell_price'] = None
-            save_state(self.state)
-            logger.info(
-                f"ROLL COMPLETE: reopened {qty_to_carry} @ {rebuy_price:.2f} in {new_expiry}. "
-                f"Grid ladder reset to single lot. Holding over weekend."
-            )
-            print_status(self.state, rebuy_price)
-        else:
-            self.state['weekend_closed'] = False
-            save_state(self.state)
-            logger.info(f"ROLL COMPLETE: was flat, broker switched to {new_expiry}. Sunday opens fresh.")
-            print_status(self.state, self._last_price)
+        # 3) Stay flat. Sunday-open (or post-weekend startup) logic buys
+        # INITIAL_QTY fresh — same treatment as a normal green-Friday flatten.
+        self.state['weekend_closed'] = True
+        save_state(self.state)
+        logger.info(
+            f"ROLL COMPLETE: flattened {qty_closed} contract(s), switched to {new_expiry}. "
+            f"Staying flat over weekend — Sunday open buys {INITIAL_QTY} fresh."
+        )
+        print_status(self.state, self._last_price)
 
     # ----------------------------------------------------------------
     def _shutdown(self):
