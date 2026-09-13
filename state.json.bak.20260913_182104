@@ -1,0 +1,23 @@
+{
+  "is_active": true,
+  "grid_level": 0,
+  "total_qty": 1,
+  "buys": [
+    {
+      "price": 7675.25,
+      "qty": 1,
+      "timestamp": "2026-09-13T18:12:59.385786"
+    }
+  ],
+  "lowest_buy_price": 7675.25,
+  "average_cost": 7675.25,
+  "realized_pnl": 0.0,
+  "profit_reserve": 0.0,
+  "last_action": "BUY 1 @ 7675.25",
+  "last_action_time": "2026-09-13T18:12:59.385786",
+  "last_sell_price": null,
+  "last_price": 7675.25,
+  "week_start_balance": null,
+  "weekend_closed": false,
+  "last_saved": "2026-09-13T18:20:58.695187"
+}

@@ -59,9 +59,46 @@ def save_state(state):
 
 
 def reset_state():
+    """
+    FULL wipe — clears position AND lifetime stats (realized_pnl,
+    profit_reserve) back to zero. This is a destructive, intentional reset
+    and should only ever be called for a deliberate "start completely over"
+    action. It must NEVER be called automatically from broker reconciliation
+    — a position-count mismatch has nothing to do with your trading history.
+    Use reset_position_only() for reconciliation instead.
+    """
     state = default_state()
     save_state(state)
-    logger.info("State reset to clean slate.")
+    logger.info("State reset to clean slate (realized_pnl and profit_reserve zeroed).")
+    return state
+
+
+def reset_position_only(state):
+    """
+    Clear position-related fields only — is_active, buys, total_qty,
+    grid_level, lowest_buy_price, average_cost, last_sell_price — while
+    PRESERVING lifetime stats: realized_pnl, profit_reserve, and any other
+    running totals.
+
+    Use this for broker reconciliation mismatches (state says N contracts,
+    IBKR says a different N — e.g. after a roll, a restart mid-trade, or a
+    dropped connection). A position-count mismatch is a bookkeeping issue
+    about the CURRENT position, not a reason to erase trading history.
+    reset_state() (full wipe) is reserved for an explicit, intentional
+    full reset — never called automatically from reconciliation.
+    """
+    state['is_active'] = False
+    state['grid_level'] = 0
+    state['total_qty'] = 0
+    state['buys'] = []
+    state['lowest_buy_price'] = None
+    state['average_cost'] = None
+    state['last_sell_price'] = None
+    save_state(state)
+    logger.info(
+        f"Position fields reset to flat (realized_pnl=${state.get('realized_pnl', 0):.2f} "
+        f"and profit_reserve=${state.get('profit_reserve', 0):.2f} preserved)."
+    )
     return state
 
 
